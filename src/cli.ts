@@ -251,6 +251,7 @@ async function cmdResolve(): Promise<void> {
 
   // Get the local action to find the AgentGate action ID
   const keys = loadOrCreateKeypair(identityFile);
+  const resolverId = await createIdentity(keys, identityFile);
 
   // Find the action in local DB
   const { getDb } = await import("./db");
@@ -265,7 +266,7 @@ async function cmdResolve(): Promise<void> {
   }
 
   // Resolve in AgentGate
-  await resolveAgentGateAction(keys, action.agentgate_action_id, outcome);
+  await resolveAgentGateAction(keys, resolverId, action.agentgate_action_id, outcome);
 
   // Resolve locally (maps outcome — AgentGate uses "success"/"failed",
   // local supports "success"/"failed"/"malicious")

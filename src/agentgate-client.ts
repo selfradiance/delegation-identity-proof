@@ -229,61 +229,6 @@ async function signedPost(
   return data;
 }
 
-async function signedGet(
-  apiPath: string,
-  keys: AgentKeys
-): Promise<Record<string, unknown>> {
-  const { agentGateUrl, apiKey } = getConfig();
-  const nonce = randomUUID();
-  const timestamp = Date.now().toString();
-  // GET requests sign with empty body
-  const signature = signRequest(
-    keys.publicKey,
-    keys.privateKey,
-    nonce,
-    "GET",
-    apiPath,
-    timestamp,
-    {}
-  );
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  let response: Response;
-  try {
-    response = await fetch(new URL(apiPath, agentGateUrl), {
-      method: "GET",
-      headers: {
-        "x-nonce": nonce,
-        "x-agentgate-key": apiKey,
-        "x-agentgate-timestamp": timestamp,
-        "x-agentgate-signature": signature,
-      },
-      signal: controller.signal,
-    });
-  } catch (err: unknown) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(
-        `AgentGate request timed out after ${REQUEST_TIMEOUT_MS / 1000}s: ${apiPath}`
-      );
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  const data = await parseResponse(response);
-
-  if (!response.ok) {
-    throw new Error(
-      `AgentGate ${apiPath} failed (${response.status}): ${JSON.stringify(data)}`
-    );
-  }
-
-  return data;
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -339,13 +284,6 @@ export async function postBond(
   return data;
 }
 
-export async function getBondStatus(
-  keys: AgentKeys,
-  bondId: string
-): Promise<Record<string, unknown>> {
-  return signedGet(`/v1/bonds/${bondId}`, keys);
-}
-
 export async function executeBondedAction(
   keys: AgentKeys,
   identityId: string,
@@ -375,8 +313,13 @@ export async function executeBondedAction(
 
 export async function resolveAgentGateAction(
   keys: AgentKeys,
+  resolverId: string,
   actionId: string,
-  outcome: "success" | "failed"
+  outcome: "success" | "failed" | "malicious"
 ): Promise<Record<string, unknown>> {
-  return signedPost(`/v1/actions/${actionId}/resolve`, { outcome }, keys);
+  return signedPost(
+    `/v1/actions/${actionId}/resolve`,
+    { outcome, resolverId },
+    keys
+  );
 }
