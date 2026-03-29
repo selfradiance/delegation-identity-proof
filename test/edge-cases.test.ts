@@ -47,13 +47,14 @@ function quickDelegation(overrides?: Partial<{
 }
 
 function acceptIt(id: string) {
-  claimForAccept(id);
+  claimForAccept(id, "agent-key");
   finalizeAccept(id, "bond-a");
 }
 
 function actAndFinalize(delegationId: string, exposure = 50) {
   const r = reserveAction({
     delegationId,
+    actorPublicKey: "agent-key",
     actionType: "email-rewrite",
     declaredExposureCents: exposure,
   });
@@ -100,6 +101,7 @@ describe("capacity math edge cases", () => {
     // Third action: would push to 300¢ → should be rejected
     const r3 = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-key",
       actionType: "email-rewrite",
       declaredExposureCents: 83,
     });
@@ -110,7 +112,7 @@ describe("capacity math edge cases", () => {
 describe("expiry edge cases", () => {
   it("expired delegation rejects accept", () => {
     const d = quickDelegation({ ttlSeconds: -1 });
-    const claimed = claimForAccept(d.id);
+    const claimed = claimForAccept(d.id, "agent-key");
     expect(claimed).toBeNull();
   });
 
@@ -123,6 +125,7 @@ describe("expiry edge cases", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -164,6 +167,7 @@ describe("settling state", () => {
     // Try to act — should fail
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -242,7 +246,7 @@ describe("outcome computation edge cases", () => {
 
 describe("guard clauses", () => {
   it("cannot accept non-existent delegation", () => {
-    const result = claimForAccept("nonexistent-id");
+    const result = claimForAccept("nonexistent-id", "agent-key");
     expect(result).toBeNull();
   });
 
@@ -270,6 +274,7 @@ describe("guard clauses", () => {
     revokeDelegation(d.id);
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -307,6 +312,7 @@ describe("event trail completeness", () => {
 
     reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-key",
       actionType: "not-allowed",
       declaredExposureCents: 50,
     });

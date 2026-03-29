@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { closeDb } from "../src/db";
+import { closeDb, getDb } from "../src/db";
 import {
   createDelegation,
   getDelegation,
@@ -82,14 +82,14 @@ describe("createDelegation", () => {
 describe("accept — two-phase", () => {
   it("claim moves status to accepting", () => {
     const d = makeTestDelegation();
-    const claimed = claimForAccept(d.id);
+    const claimed = claimForAccept(d.id, "agent-pub-key");
     expect(claimed).not.toBeNull();
     expect(claimed!.status).toBe("accepting");
   });
 
   it("finalize moves to accepted with bond ID", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     const accepted = finalizeAccept(d.id, "agent-bond-456");
     expect(accepted).not.toBeNull();
     expect(accepted!.status).toBe("accepted");
@@ -99,7 +99,7 @@ describe("accept — two-phase", () => {
 
   it("revert moves back to pending", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     revertAccept(d.id);
     const reverted = getDelegation(d.id)!;
     expect(reverted.status).toBe("pending");
@@ -107,20 +107,26 @@ describe("accept — two-phase", () => {
 
   it("double-claim fails", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
-    const second = claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
+    const second = claimForAccept(d.id, "agent-pub-key");
     expect(second).toBeNull();
   });
 
   it("cannot accept expired delegation", () => {
     const d = makeTestDelegation({ ttlSeconds: -1 }); // already expired
-    const claimed = claimForAccept(d.id);
+    const claimed = claimForAccept(d.id, "agent-pub-key");
+    expect(claimed).toBeNull();
+  });
+
+  it("rejects accept from the wrong agent key", () => {
+    const d = makeTestDelegation();
+    const claimed = claimForAccept(d.id, "wrong-agent-pub-key");
     expect(claimed).toBeNull();
   });
 
   it("logs delegation_accepted event on finalize", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
     const events = getEvents(d.id);
     const acceptEvent = events.find(
@@ -132,7 +138,7 @@ describe("accept — two-phase", () => {
 
 describe("act — two-phase with scope validation", () => {
   function acceptDelegation(id: string): void {
-    claimForAccept(id);
+    claimForAccept(id, "agent-pub-key");
     finalizeAccept(id, "agent-bond-456");
   }
 
@@ -142,6 +148,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 83,
     });
@@ -155,6 +162,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "delete-all",
       declaredExposureCents: 50,
     });
@@ -167,6 +175,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -180,6 +189,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 83,
     });
@@ -197,6 +207,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 83,
     });
@@ -214,6 +225,7 @@ describe("act — two-phase with scope validation", () => {
 
     reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "delete-all",
       declaredExposureCents: 50,
     });
@@ -231,6 +243,7 @@ describe("act — two-phase with scope validation", () => {
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -241,16 +254,89 @@ describe("act — two-phase with scope validation", () => {
     const executed = events.find((e) => e.event_type === "action_executed");
     expect(executed).toBeDefined();
   });
+
+  it("rejects actions from a non-delegated agent key", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const result = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "wrong-agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    expect("valid" in result && !result.valid).toBe(true);
+    if ("valid" in result) {
+      expect(result.reason).toContain("delegated agent");
+    }
+  });
+
+  it("counts in-flight reservations against max_actions immediately", () => {
+    const d = makeTestDelegation({
+      scope: {
+        ...TEST_SCOPE,
+        max_actions: 1,
+      },
+    });
+    acceptDelegation(d.id);
+
+    const first = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in first)) throw new Error("Expected reservation");
+
+    const second = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    expect("valid" in second && !second.valid).toBe(true);
+  });
+
+  it("counts in-flight reservations against total exposure immediately", () => {
+    const d = makeTestDelegation({
+      scope: {
+        ...TEST_SCOPE,
+        max_actions: 3,
+        max_total_exposure_cents: 100,
+      },
+    });
+    acceptDelegation(d.id);
+
+    const first = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 83,
+    });
+    if (!("actionId" in first)) throw new Error("Expected reservation");
+
+    const second = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 1,
+    });
+
+    expect("valid" in second && !second.valid).toBe(true);
+  });
 });
 
 describe("resolveAction", () => {
   function setupWithAction(): { delegationId: string; actionId: string } {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -294,11 +380,12 @@ describe("auto-complete — exhaustion", () => {
       description: "Single action",
     };
     const d = makeTestDelegation({ scope });
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -327,11 +414,12 @@ describe("revokeDelegation", () => {
 
   it("revokes active delegation with no open actions to completed", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -347,11 +435,12 @@ describe("revokeDelegation", () => {
 
   it("revokes active delegation with open actions to settling", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -363,13 +452,32 @@ describe("revokeDelegation", () => {
     expect(revoked!.terminal_reason).toBe("revoked");
   });
 
-  it("settling completes when last action resolved", () => {
+  it("treats an in-flight reservation as open when revoking", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in result)) throw new Error("Expected reservation");
+
+    const revoked = revokeDelegation(d.id);
+    expect(revoked!.status).toBe("settling");
+    expect(revoked!.terminal_reason).toBe("revoked");
+  });
+
+  it("settling completes when last action resolved", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const result = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -391,16 +499,36 @@ describe("revokeDelegation", () => {
     const second = revokeDelegation(d.id);
     expect(second).toBeNull();
   });
+
+  it("cannot revoke a delegation already in settling", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const result = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in result)) throw new Error("Expected reservation");
+    finalizeAction(result.actionId, d.id, "ag-action-001");
+
+    expect(revokeDelegation(d.id)?.status).toBe("settling");
+    expect(revokeDelegation(d.id)).toBeNull();
+    expect(getDelegation(d.id)!.terminal_reason).toBe("revoked");
+  });
 });
 
 describe("closeDelegation", () => {
   it("closes active delegation with all actions resolved", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -421,11 +549,12 @@ describe("closeDelegation", () => {
 
   it("cannot close with open actions", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const result = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -451,6 +580,32 @@ describe("checkExpiry", () => {
     const result = checkExpiry(d.id);
     expect(result).toBeNull();
   });
+
+  it("does not overwrite terminal reason for settling delegations", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const result = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in result)) throw new Error("Expected reservation");
+    finalizeAction(result.actionId, d.id, "ag-action-001");
+
+    revokeDelegation(d.id);
+    const db = getDb();
+    db.prepare("UPDATE delegations SET expires_at = ? WHERE id = ?").run(
+      new Date(Date.now() - 1000).toISOString(),
+      d.id
+    );
+
+    expect(checkExpiry(d.id)).toBeNull();
+    expect(getDelegation(d.id)!.status).toBe("settling");
+    expect(getDelegation(d.id)!.terminal_reason).toBe("revoked");
+  });
 });
 
 describe("computeOutcome", () => {
@@ -461,11 +616,12 @@ describe("computeOutcome", () => {
 
   it("returns 'success' when all succeed", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const r1 = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -478,11 +634,12 @@ describe("computeOutcome", () => {
 
   it("returns 'agent-malicious' if any malicious", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const r1 = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -495,11 +652,12 @@ describe("computeOutcome", () => {
 
   it("returns 'failed' if any failed and none malicious", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id);
+    claimForAccept(d.id, "agent-pub-key");
     finalizeAccept(d.id, "agent-bond-456");
 
     const r1 = reserveAction({
       delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
       actionType: "email-rewrite",
       declaredExposureCents: 50,
     });
@@ -514,12 +672,37 @@ describe("computeOutcome", () => {
 describe("recoverTransientStates", () => {
   it("reverts accepting back to pending", () => {
     const d = makeTestDelegation();
-    claimForAccept(d.id); // now in 'accepting'
+    claimForAccept(d.id, "agent-pub-key"); // now in 'accepting'
 
     const recovered = recoverTransientStates();
     expect(recovered).toBe(1);
 
     const reverted = getDelegation(d.id)!;
     expect(reverted.status).toBe("pending");
+  });
+
+  it("marks delegations with orphaned local action reservations as failed", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const reservation = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in reservation)) throw new Error("Expected reservation");
+
+    const recovered = recoverTransientStates();
+    expect(recovered).toBe(1);
+
+    const failed = getDelegation(d.id)!;
+    expect(failed.status).toBe("failed");
+
+    const events = getEvents(d.id);
+    expect(
+      events.some((event) => event.event_type === "delegation_recovery_failed")
+    ).toBe(true);
   });
 });

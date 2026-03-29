@@ -71,6 +71,11 @@ export interface DelegationEventRow {
   created_at: string;
 }
 
+interface ActionSummaryRow {
+  action_count: number;
+  total_effective_exposure_cents: number | null;
+}
+
 // --- Event logging ---
 
 function logEvent(
@@ -151,14 +156,17 @@ export function getDelegation(id: string): DelegationRow | null {
  * Phase 1 of accept: atomically claim the delegation by moving to 'accepting'.
  * Returns the delegation row if claim succeeded, null if someone else got there first.
  */
-export function claimForAccept(delegationId: string): DelegationRow | null {
+export function claimForAccept(
+  delegationId: string,
+  delegatePublicKey: string
+): DelegationRow | null {
   const db = getDb();
   const now = new Date().toISOString();
 
   const result = db.prepare(
     `UPDATE delegations SET status = 'accepting'
-     WHERE id = ? AND status = 'pending' AND expires_at > ?`
-  ).run(delegationId, now);
+     WHERE id = ? AND status = 'pending' AND expires_at > ? AND delegate_id = ?`
+  ).run(delegationId, now, delegatePublicKey);
 
   if (result.changes !== 1) return null;
   return getDelegation(delegationId);
@@ -204,6 +212,7 @@ export function revertAccept(delegationId: string): void {
 
 export interface ActParams {
   delegationId: string;
+  actorPublicKey: string;
   actionType: string;
   declaredExposureCents: number;
 }
@@ -221,81 +230,91 @@ export function reserveAction(
   params: ActParams
 ): ActReservation | ScopeCheckResult {
   const db = getDb();
-  const delegation = getDelegation(params.delegationId);
+  const reserve = db.transaction((txParams: ActParams) => {
+    const delegation = db
+      .prepare("SELECT * FROM delegations WHERE id = ?")
+      .get(txParams.delegationId) as DelegationRow | undefined;
 
-  if (!delegation) {
-    return { valid: false, reason: "Delegation not found" };
-  }
+    if (!delegation) {
+      return { valid: false, reason: "Delegation not found" };
+    }
 
-  // Guard: status must be accepted or active
-  if (delegation.status !== "accepted" && delegation.status !== "active") {
-    return {
-      valid: false,
-      reason: `Cannot act on delegation with status "${delegation.status}"`,
-    };
-  }
+    if (delegation.delegate_id !== txParams.actorPublicKey) {
+      return {
+        valid: false,
+        reason: "Only the delegated agent can act on this delegation",
+      };
+    }
 
-  // Guard: check expiry inside critical section
-  const now = new Date().toISOString();
-  if (now >= delegation.expires_at) {
-    logEvent(params.delegationId, "action_rejected_expired", {
-      action_type: params.actionType,
-      declared_exposure_cents: params.declaredExposureCents,
-    });
-    return { valid: false, reason: "Delegation has expired" };
-  }
+    // Guard: status must be accepted or active
+    if (delegation.status !== "accepted" && delegation.status !== "active") {
+      return {
+        valid: false,
+        reason: `Cannot act on delegation with status "${delegation.status}"`,
+      };
+    }
 
-  // Get scope and validate
-  const scope: DelegationScope = JSON.parse(delegation.scope_json);
+    // Guard: check expiry inside critical section
+    const now = new Date().toISOString();
+    if (now >= delegation.expires_at) {
+      logEvent(txParams.delegationId, "action_rejected_expired", {
+        action_type: txParams.actionType,
+        declared_exposure_cents: txParams.declaredExposureCents,
+      });
+      return { valid: false, reason: "Delegation has expired" };
+    }
 
-  // Count existing actions (exclude pending ones that might be in-flight from another two-phase)
-  const actionRows = db
-    .prepare(
-      "SELECT * FROM delegation_actions WHERE delegation_id = ? AND agentgate_action_id IS NOT NULL"
-    )
-    .all(params.delegationId) as DelegationActionRow[];
+    // Get scope and validate.
+    const scope: DelegationScope = JSON.parse(delegation.scope_json);
+    const summary = db
+      .prepare(
+        `SELECT
+           COUNT(*) as action_count,
+           COALESCE(SUM(effective_exposure_cents), 0) as total_effective_exposure_cents
+         FROM delegation_actions
+         WHERE delegation_id = ?`
+      )
+      .get(txParams.delegationId) as ActionSummaryRow;
 
-  const actionsTaken = actionRows.length;
-  const totalEffective = actionRows.reduce(
-    (sum, a) => sum + a.effective_exposure_cents,
-    0
-  );
+    const scopeCheck = validateAction(
+      scope,
+      txParams.actionType,
+      txParams.declaredExposureCents,
+      summary.action_count,
+      summary.total_effective_exposure_cents ?? 0
+    );
 
-  const scopeCheck = validateAction(
-    scope,
-    params.actionType,
-    params.declaredExposureCents,
-    actionsTaken,
-    totalEffective
-  );
+    if (!scopeCheck.valid) {
+      logEvent(txParams.delegationId, "action_rejected_scope", {
+        action_type: txParams.actionType,
+        declared_exposure_cents: txParams.declaredExposureCents,
+        reason: scopeCheck.reason,
+      });
+      return scopeCheck;
+    }
 
-  if (!scopeCheck.valid) {
-    logEvent(params.delegationId, "action_rejected_scope", {
-      action_type: params.actionType,
-      declared_exposure_cents: params.declaredExposureCents,
-      reason: scopeCheck.reason,
-    });
-    return scopeCheck;
-  }
+    // Reserve action slot before leaving the transaction so concurrent callers
+    // see this reservation in max_actions and total exposure calculations.
+    const actionId = randomUUID();
+    const effective = effectiveExposure(txParams.declaredExposureCents);
 
-  // Reserve action slot
-  const actionId = randomUUID();
-  const effective = effectiveExposure(params.declaredExposureCents);
+    db.prepare(
+      `INSERT INTO delegation_actions
+       (id, delegation_id, action_type, declared_exposure_cents, effective_exposure_cents, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      actionId,
+      txParams.delegationId,
+      txParams.actionType,
+      txParams.declaredExposureCents,
+      effective,
+      now
+    );
 
-  db.prepare(
-    `INSERT INTO delegation_actions
-     (id, delegation_id, action_type, declared_exposure_cents, effective_exposure_cents, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(
-    actionId,
-    params.delegationId,
-    params.actionType,
-    params.declaredExposureCents,
-    effective,
-    now
-  );
+    return { actionId, delegation };
+  });
 
-  return { actionId, delegation };
+  return reserve.immediate(params);
 }
 
 /**
@@ -307,22 +326,39 @@ export function finalizeAction(
   agentgateActionId: string
 ): void {
   const db = getDb();
+  const finalize = db.transaction(
+    (txActionId: string, txDelegationId: string, txAgentgateActionId: string) => {
+      const action = db
+        .prepare(
+          `SELECT delegation_id FROM delegation_actions
+           WHERE id = ? AND agentgate_action_id IS NULL`
+        )
+        .get(txActionId) as { delegation_id: string } | undefined;
 
-  db.prepare(
-    `UPDATE delegation_actions SET agentgate_action_id = ?
-     WHERE id = ? AND agentgate_action_id IS NULL`
-  ).run(agentgateActionId, actionId);
+      if (!action || action.delegation_id !== txDelegationId) {
+        return;
+      }
 
-  // Move delegation to active if it was accepted
-  db.prepare(
-    `UPDATE delegations SET status = 'active'
-     WHERE id = ? AND status IN ('accepted', 'active')`
-  ).run(delegationId);
+      db.prepare(
+        `UPDATE delegation_actions SET agentgate_action_id = ?
+         WHERE id = ? AND agentgate_action_id IS NULL`
+      ).run(txAgentgateActionId, txActionId);
 
-  logEvent(delegationId, "action_executed", {
-    action_id: actionId,
-    agentgate_action_id: agentgateActionId,
-  });
+      // Move delegation to active if it was accepted. Settling/completed
+      // delegations keep their current state when an in-flight action finalizes.
+      db.prepare(
+        `UPDATE delegations SET status = 'active'
+         WHERE id = ? AND status IN ('accepted', 'active')`
+      ).run(txDelegationId);
+
+      logEvent(txDelegationId, "action_executed", {
+        action_id: txActionId,
+        agentgate_action_id: txAgentgateActionId,
+      });
+    }
+  );
+
+  finalize.immediate(actionId, delegationId, agentgateActionId);
 }
 
 /**
@@ -374,6 +410,7 @@ export function revokeDelegation(delegationId: string): DelegationRow | null {
 
   // Guard: cannot revoke terminal or transient states
   if (
+    delegation.status === "settling" ||
     delegation.status === "completed" ||
     delegation.status === "failed" ||
     delegation.status === "accepting"
@@ -388,27 +425,31 @@ export function revokeDelegation(delegationId: string): DelegationRow | null {
   const openActions = db
     .prepare(
       `SELECT COUNT(*) as count FROM delegation_actions
-       WHERE delegation_id = ? AND outcome IS NULL AND agentgate_action_id IS NOT NULL`
+       WHERE delegation_id = ? AND outcome IS NULL`
     )
     .get(delegationId) as { count: number };
 
   if (openActions.count > 0) {
     // Move to settling — actions still need resolution
-    db.prepare(
+    const result = db.prepare(
       `UPDATE delegations SET status = 'settling', terminal_reason = 'revoked'
-       WHERE id = ?`
+       WHERE id = ? AND status IN ('pending', 'accepted', 'active')`
     ).run(delegationId);
+
+    if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_revoked", { settling: true });
   } else {
     // No open actions — go straight to completed
     const outcome = computeOutcome(delegationId);
-    db.prepare(
+    const result = db.prepare(
       `UPDATE delegations
        SET status = 'completed', terminal_reason = 'revoked',
            delegation_outcome = ?, completed_at = ?
-       WHERE id = ?`
+       WHERE id = ? AND status IN ('pending', 'accepted', 'active')`
     ).run(outcome, now, delegationId);
+
+    if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_revoked", { settling: false });
     logEvent(delegationId, "delegation_completed", {
@@ -434,7 +475,7 @@ export function closeDelegation(delegationId: string): DelegationRow | null {
   const openActions = db
     .prepare(
       `SELECT COUNT(*) as count FROM delegation_actions
-       WHERE delegation_id = ? AND outcome IS NULL AND agentgate_action_id IS NOT NULL`
+       WHERE delegation_id = ? AND outcome IS NULL`
     )
     .get(delegationId) as { count: number };
 
@@ -443,12 +484,14 @@ export function closeDelegation(delegationId: string): DelegationRow | null {
   const now = new Date().toISOString();
   const outcome = computeOutcome(delegationId);
 
-  db.prepare(
+  const result = db.prepare(
     `UPDATE delegations
      SET status = 'completed', terminal_reason = 'closed',
          delegation_outcome = ?, completed_at = ?
-     WHERE id = ?`
+     WHERE id = ? AND status = 'active'`
   ).run(outcome, now, delegationId);
+
+  if (result.changes !== 1) return null;
 
   logEvent(delegationId, "delegation_completed", {
     outcome,
@@ -469,6 +512,7 @@ export function checkExpiry(delegationId: string): DelegationRow | null {
 
   // Only expire non-terminal, non-transient delegations
   if (
+    delegation.status === "settling" ||
     delegation.status === "completed" ||
     delegation.status === "failed" ||
     delegation.status === "accepting"
@@ -481,25 +525,29 @@ export function checkExpiry(delegationId: string): DelegationRow | null {
   const openActions = db
     .prepare(
       `SELECT COUNT(*) as count FROM delegation_actions
-       WHERE delegation_id = ? AND outcome IS NULL AND agentgate_action_id IS NOT NULL`
+       WHERE delegation_id = ? AND outcome IS NULL`
     )
     .get(delegationId) as { count: number };
 
   if (openActions.count > 0) {
-    db.prepare(
+    const result = db.prepare(
       `UPDATE delegations SET status = 'settling', terminal_reason = 'expired'
-       WHERE id = ?`
+       WHERE id = ? AND status IN ('pending', 'accepted', 'active')`
     ).run(delegationId);
+
+    if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_expired", { settling: true });
   } else {
     const outcome = computeOutcome(delegationId);
-    db.prepare(
+    const result = db.prepare(
       `UPDATE delegations
        SET status = 'completed', terminal_reason = 'expired',
            delegation_outcome = ?, completed_at = ?
-       WHERE id = ?`
+       WHERE id = ? AND status IN ('pending', 'accepted', 'active')`
     ).run(outcome, now, delegationId);
+
+    if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_expired", { settling: false });
     logEvent(delegationId, "delegation_completed", {
@@ -516,12 +564,11 @@ export function checkExpiry(delegationId: string): DelegationRow | null {
 export function computeOutcome(delegationId: string): DelegationOutcome {
   const db = getDb();
   const actions = db
-    .prepare(
-      "SELECT * FROM delegation_actions WHERE delegation_id = ? AND agentgate_action_id IS NOT NULL"
-    )
+    .prepare("SELECT * FROM delegation_actions WHERE delegation_id = ?")
     .all(delegationId) as DelegationActionRow[];
 
   if (actions.length === 0) return "none";
+  if (actions.some((a) => a.outcome === null)) return "none";
 
   const hasMalicious = actions.some((a) => a.outcome === "malicious");
   if (hasMalicious) return "agent-malicious";
@@ -550,18 +597,20 @@ function tryAutoComplete(delegationId: string): void {
     const openActions = db
       .prepare(
         `SELECT COUNT(*) as count FROM delegation_actions
-         WHERE delegation_id = ? AND outcome IS NULL AND agentgate_action_id IS NOT NULL`
+         WHERE delegation_id = ? AND outcome IS NULL`
       )
       .get(delegationId) as { count: number };
 
     if (openActions.count === 0) {
       const now = new Date().toISOString();
       const outcome = computeOutcome(delegationId);
-      db.prepare(
+      const result = db.prepare(
         `UPDATE delegations
          SET status = 'completed', delegation_outcome = ?, completed_at = ?
-         WHERE id = ?`
+         WHERE id = ? AND status = 'settling'`
       ).run(outcome, now, delegationId);
+
+      if (result.changes !== 1) return;
 
       logEvent(delegationId, "delegation_completed", {
         outcome,
@@ -574,9 +623,7 @@ function tryAutoComplete(delegationId: string): void {
   if (delegation.status === "active") {
     const scope: DelegationScope = JSON.parse(delegation.scope_json);
     const actions = db
-      .prepare(
-        "SELECT * FROM delegation_actions WHERE delegation_id = ? AND agentgate_action_id IS NOT NULL"
-      )
+      .prepare("SELECT * FROM delegation_actions WHERE delegation_id = ?")
       .all(delegationId) as DelegationActionRow[];
 
     if (actions.length >= scope.max_actions) {
@@ -584,12 +631,14 @@ function tryAutoComplete(delegationId: string): void {
       if (allResolved) {
         const now = new Date().toISOString();
         const outcome = computeOutcome(delegationId);
-        db.prepare(
+        const result = db.prepare(
           `UPDATE delegations
            SET status = 'completed', terminal_reason = 'exhausted',
                delegation_outcome = ?, completed_at = ?
-           WHERE id = ?`
+           WHERE id = ? AND status = 'active'`
         ).run(outcome, now, delegationId);
+
+        if (result.changes !== 1) return;
 
         logEvent(delegationId, "delegation_completed", {
           outcome,
@@ -604,11 +653,44 @@ function tryAutoComplete(delegationId: string): void {
 
 export function recoverTransientStates(): number {
   const db = getDb();
-  const result = db.prepare(
-    `UPDATE delegations SET status = 'pending'
-     WHERE status = 'accepting'`
-  ).run();
-  return result.changes;
+  const now = new Date().toISOString();
+  let recovered = 0;
+
+  const recover = db.transaction(() => {
+    const acceptResult = db.prepare(
+      `UPDATE delegations SET status = 'pending'
+       WHERE status = 'accepting'`
+    ).run();
+    recovered += acceptResult.changes;
+
+    const indeterminateDelegations = db
+      .prepare(
+        `SELECT DISTINCT delegation_id
+         FROM delegation_actions
+         WHERE agentgate_action_id IS NULL`
+      )
+      .all() as { delegation_id: string }[];
+
+    const markFailed = db.prepare(
+      `UPDATE delegations
+       SET status = 'failed'
+       WHERE id = ? AND status IN ('pending', 'accepted', 'active', 'settling')`
+    );
+
+    for (const row of indeterminateDelegations) {
+      const result = markFailed.run(row.delegation_id);
+      if (result.changes === 1) {
+        recovered += 1;
+        logEvent(row.delegation_id, "delegation_recovery_failed", {
+          reason: "orphaned_local_action_reservation",
+          detected_at: now,
+        });
+      }
+    }
+  });
+
+  recover.immediate();
+  return recovered;
 }
 
 // --- Query helpers ---

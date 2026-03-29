@@ -45,6 +45,13 @@ export function validateAction(
   actionsTaken: number,
   totalEffectiveExposureSoFar: number
 ): ScopeCheckResult {
+  if (!Number.isInteger(declaredExposureCents) || declaredExposureCents <= 0) {
+    return {
+      valid: false,
+      reason: "Declared exposure must be a positive integer number of cents",
+    };
+  }
+
   // Check action type is in allowlist
   if (!scope.allowed_actions.includes(actionType)) {
     return {

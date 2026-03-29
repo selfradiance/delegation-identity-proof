@@ -2,8 +2,10 @@
 // These tests require:
 //   1. AgentGate running (cd ~/Desktop/projects/agentgate && npm run restart)
 //   2. AGENTGATE_URL and AGENTGATE_REST_KEY set in .env
+//   3. RUN_INTEGRATION_TESTS=1 when invoking npm test
 //
-// Tests are skipped automatically when AgentGate is not available.
+// Tests are skipped automatically unless AgentGate is configured and
+// RUN_INTEGRATION_TESTS=1 is set explicitly.
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
@@ -19,6 +21,7 @@ import fs from "fs";
 import "dotenv/config";
 
 const HAS_AGENTGATE =
+  process.env.RUN_INTEGRATION_TESTS === "1" &&
   !!process.env.AGENTGATE_URL &&
   !!process.env.AGENTGATE_REST_KEY &&
   !process.env.AGENTGATE_REST_KEY.includes("your-");

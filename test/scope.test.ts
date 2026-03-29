@@ -103,6 +103,14 @@ describe("validateAction — scope checks", () => {
     expect(result.reason).toContain("max_exposure_cents");
   });
 
+  it("rejects non-positive or fractional exposure values", () => {
+    expect(validateAction(scope, "email-rewrite", 0, 0, 0).valid).toBe(false);
+    expect(validateAction(scope, "email-rewrite", -1, 0, 0).valid).toBe(false);
+    expect(validateAction(scope, "email-rewrite", 12.5, 0, 0).valid).toBe(
+      false
+    );
+  });
+
   it("rejects when total effective exposure would exceed limit", () => {
     // Two prior actions at 83¢ each → effective = 100¢ each = 200¢ total
     // New action at 83¢ → effective = 100¢ → projected = 300¢ → exactly at limit, should pass

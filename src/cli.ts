@@ -3,6 +3,11 @@ import "dotenv/config";
 import { createHash } from "crypto";
 
 import {
+  getAgentBondTtlSeconds,
+  getHumanBondTtlSeconds,
+  MAX_DELEGATION_TTL_SECONDS,
+} from "./bond-ttl";
+import {
   loadOrCreateKeypair,
   createIdentity,
   postBond,
@@ -28,7 +33,7 @@ import {
   getEvents,
   type DelegationRow,
 } from "./delegation";
-import type { DelegationScope } from "./scope";
+import { DelegationScopeSchema, type DelegationScope } from "./scope";
 
 // ---------------------------------------------------------------------------
 // Arg parsing helpers
@@ -54,11 +59,43 @@ function getNumArg(name: string, required = false): number | undefined {
   const val = getArg(name, required as true);
   if (val === undefined) return undefined;
   const n = Number(val);
-  if (isNaN(n)) {
+  if (!Number.isFinite(n)) {
     console.error(`Invalid number for --${name}: ${val}`);
     process.exit(1);
   }
   return n;
+}
+
+function getPositiveIntArg(name: string, required: true): number;
+function getPositiveIntArg(name: string, required?: false): number | undefined;
+function getPositiveIntArg(
+  name: string,
+  required = false
+): number | undefined {
+  const n = getNumArg(name, required as true);
+  if (n === undefined) return undefined;
+  if (!Number.isInteger(n) || n <= 0) {
+    console.error(`--${name} must be a positive integer.`);
+    process.exit(1);
+  }
+  return n;
+}
+
+function parsePayloadArg(payloadStr: string): Record<string, unknown> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadStr);
+  } catch {
+    console.error(`Invalid JSON in --payload: ${payloadStr}`);
+    process.exit(1);
+  }
+
+  if (!payload || Array.isArray(payload) || typeof payload !== "object") {
+    console.error("--payload must be a JSON object.");
+    process.exit(1);
+  }
+
+  return payload as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -68,18 +105,31 @@ function getNumArg(name: string, required = false): number | undefined {
 async function cmdDelegate(): Promise<void> {
   const to = getArg("to", true);
   const actionsStr = getArg("actions", true);
-  const maxActions = getNumArg("max-actions", true);
-  const maxExposure = getNumArg("max-exposure", true);
-  const maxTotalExposure = getNumArg("max-total-exposure", true);
-  const bondAmount = getNumArg("bond", true);
-  const ttl = getNumArg("ttl", true);
+  const maxActions = getPositiveIntArg("max-actions", true);
+  const maxExposure = getPositiveIntArg("max-exposure", true);
+  const maxTotalExposure = getPositiveIntArg("max-total-exposure", true);
+  const bondAmount = getPositiveIntArg("bond", true);
+  const ttl = getPositiveIntArg("ttl", true);
   const description = getArg("description", true);
   const identityFile = getArg("identity-file");
 
-  if (ttl > 86400) {
-    console.error("TTL cannot exceed 86400 seconds (AgentGate bond TTL cap).");
+  if (ttl > MAX_DELEGATION_TTL_SECONDS) {
+    console.error(
+      `TTL cannot exceed ${MAX_DELEGATION_TTL_SECONDS} seconds so the human bond can keep a 1-hour safety margin under AgentGate's 86400-second cap.`
+    );
     process.exit(1);
   }
+
+  const scope: DelegationScope = DelegationScopeSchema.parse({
+    allowed_actions: actionsStr
+      .split(",")
+      .map((action) => action.trim())
+      .filter((action) => action.length > 0),
+    max_actions: maxActions,
+    max_exposure_cents: maxExposure,
+    max_total_exposure_cents: maxTotalExposure,
+    description,
+  });
 
   const keys = loadOrCreateKeypair(identityFile);
   const identityId = await createIdentity(keys, identityFile);
@@ -92,20 +142,11 @@ async function cmdDelegate(): Promise<void> {
     keys,
     identityId,
     bondAmount,
-    ttl + 3600, // bond TTL exceeds delegation TTL by 1 hour margin
+    getHumanBondTtlSeconds(ttl),
     "Delegation commitment deposit"
   );
   const bondId = bondResult.bondId as string;
   console.log(`Human bond locked: ${bondId}`);
-
-  // Create local delegation record
-  const scope: DelegationScope = {
-    allowed_actions: actionsStr.split(","),
-    max_actions: maxActions,
-    max_exposure_cents: maxExposure,
-    max_total_exposure_cents: maxTotalExposure,
-    description,
-  };
 
   const delegation = createDelegation({
     delegatorId: keys.publicKey,
@@ -125,20 +166,16 @@ async function cmdDelegate(): Promise<void> {
 
 async function cmdAccept(): Promise<void> {
   const delegationId = getArg("delegation", true);
-  const bondAmount = getNumArg("bond", true);
+  const bondAmount = getPositiveIntArg("bond", true);
   const identityFile = getArg("identity-file");
 
   const keys = loadOrCreateKeypair(identityFile);
-  const identityId = await createIdentity(keys, identityFile);
-
-  console.log(`Agent identity: ${identityId}`);
-  console.log(`Agent public key: ${keys.publicKey}`);
 
   // Phase 1: claim
-  const claimed = claimForAccept(delegationId);
+  const claimed = claimForAccept(delegationId, keys.publicKey);
   if (!claimed) {
     console.error(
-      "Failed to claim delegation. It may not exist, is not pending, or has expired."
+      "Failed to claim delegation. It may not exist, may target a different agent key, is not pending, or has expired."
     );
     process.exit(1);
   }
@@ -146,18 +183,24 @@ async function cmdAccept(): Promise<void> {
   // Phase 2: post bond to AgentGate
   let bondId: string;
   try {
+    const identityId = await createIdentity(keys, identityFile);
+    const bondTtlSeconds = getAgentBondTtlSeconds(claimed.expires_at);
+
+    console.log(`Agent identity: ${identityId}`);
+    console.log(`Agent public key: ${keys.publicKey}`);
+
     const bondResult = await postBond(
       keys,
       identityId,
       bondAmount,
-      3600, // 1 hour TTL for agent bond
+      bondTtlSeconds,
       `Agent bond for delegation ${delegationId}`
     );
     bondId = bondResult.bondId as string;
   } catch (err) {
     // Phase 3: revert on failure
     revertAccept(delegationId);
-    console.error(`Failed to post agent bond: ${err}`);
+    console.error(`Failed to register agent identity or post agent bond: ${err}`);
     process.exit(1);
   }
 
@@ -177,16 +220,17 @@ async function cmdAccept(): Promise<void> {
 async function cmdAct(): Promise<void> {
   const delegationId = getArg("delegation", true);
   const actionType = getArg("action-type", true);
-  const exposure = getNumArg("exposure", true);
+  const exposure = getPositiveIntArg("exposure", true);
   const payloadStr = getArg("payload") ?? "{}";
   const identityFile = getArg("identity-file");
+  const payload = parsePayloadArg(payloadStr);
 
   const keys = loadOrCreateKeypair(identityFile);
-  const identityId = await createIdentity(keys, identityFile);
 
   // Phase 1: validate scope and reserve action slot
   const reservation = reserveAction({
     delegationId,
+    actorPublicKey: keys.publicKey,
     actionType,
     declaredExposureCents: exposure,
   });
@@ -206,13 +250,8 @@ async function cmdAct(): Promise<void> {
   // Phase 2: execute in AgentGate
   let agentgateActionId: string;
   try {
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(payloadStr);
-    } catch {
-      console.error(`Invalid JSON in --payload: ${payloadStr}`);
-      process.exit(1);
-    }
+    const identityId = await createIdentity(keys, identityFile);
+
     // Embed delegation metadata in action payload (convention per spec)
     payload.delegation_id = delegationId;
     payload.delegator_id = delegation.delegator_id;
@@ -252,7 +291,7 @@ async function cmdAct(): Promise<void> {
       process.exit(1);
     }
 
-    console.error(`AgentGate action failed: ${err}`);
+    console.error(`Failed to register agent identity or execute action: ${err}`);
     process.exit(1);
   }
 
@@ -276,21 +315,31 @@ async function cmdResolve(): Promise<void> {
     process.exit(1);
   }
 
-  // Get the local action to find the AgentGate action ID
-  const keys = loadOrCreateKeypair(identityFile);
-  const resolverId = await createIdentity(keys, identityFile);
-
   // Find the action in local DB
   const { getDb } = await import("./db");
   const db = getDb();
   const action = db
     .prepare("SELECT * FROM delegation_actions WHERE id = ?")
-    .get(actionId) as { agentgate_action_id: string; delegation_id: string } | undefined;
+    .get(actionId) as
+    | {
+        agentgate_action_id: string;
+        delegation_id: string;
+        outcome: string | null;
+      }
+    | undefined;
 
   if (!action || !action.agentgate_action_id) {
     console.error("Action not found or not yet finalized.");
     process.exit(1);
   }
+
+  if (action.outcome !== null) {
+    console.error("Action is already resolved locally.");
+    process.exit(1);
+  }
+
+  const keys = loadOrCreateKeypair(identityFile);
+  const resolverId = await createIdentity(keys, identityFile);
 
   // Resolve in AgentGate
   await resolveAgentGateAction(
