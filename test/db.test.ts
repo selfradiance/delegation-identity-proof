@@ -1,18 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { getDb, closeDb } from "../src/db";
-import fs from "fs";
-
-const TEST_DB = "test-delegation.db";
 
 beforeEach(() => {
-  process.env.DELEGATION_DB_PATH = TEST_DB;
+  process.env.DELEGATION_DB_PATH = ":memory:";
 });
 
 afterEach(() => {
   closeDb();
-  if (fs.existsSync(TEST_DB)) fs.unlinkSync(TEST_DB);
-  if (fs.existsSync(TEST_DB + "-wal")) fs.unlinkSync(TEST_DB + "-wal");
-  if (fs.existsSync(TEST_DB + "-shm")) fs.unlinkSync(TEST_DB + "-shm");
   delete process.env.DELEGATION_DB_PATH;
 });
 

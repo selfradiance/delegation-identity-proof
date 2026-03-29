@@ -4,4 +4,7 @@ dist/
 *_PROJECT_CONTEXT.md
 agent-identity*.json
 *.log
+*.db
+*.db-wal
+*.db-shm
 .DS_Store
