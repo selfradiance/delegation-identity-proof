@@ -1,126 +1,87 @@
 # Delegation Identity Proof
 
-A proof-of-concept demonstrating delegated authority with economic accountability. A human delegates bounded authority to an AI agent. Both parties post bonds. The agent acts within the delegated scope. AgentGate settles the outcome.
+A proof-of-concept for bounded human-to-agent delegation with economic accountability. A human delegates scoped authority to an agent, both parties post bonds, and actions are settled through AgentGate.
 
-## What Problem It Solves
+## Why This Exists
 
-Today's agent identity approaches (OAuth tokens, API keys, CIBA flows) answer "is this agent authenticated?" but not "who authorized this agent to do this specific thing, and what happens if it goes wrong?"
+Current agent identity systems answer "who is this agent?" but not "who authorized it, to do what, within what limits, and with what accountability?" Delegation Identity Proof fills that gap. The human has skin in the game too — not just the agent.
 
-AgentGate already makes bad actions costly. The delegation proof adds the question that comes *before* the action: who gave the agent permission, under what constraints, and with what accountability?
+## How It Relates to AgentGate
 
-## Architecture
+[AgentGate](https://github.com/selfradiance/agentgate) is the enforcement substrate. This project calls AgentGate's REST API for identity registration, bond management, action execution, and resolution. No changes to AgentGate core were needed — this is a client, not an extension.
 
-```
-Human (CLI)  →  Delegation Engine  →  AgentGate REST API
-Agent (CLI)  →  Scope Validator    →  Ed25519 Signed Requests
-                SQLite (local)         Bonds & Settlement
-```
+AgentGate must be running for this project to work.
 
-AgentGate remains semantically unaware of delegations. The delegation layer is client-side governance with a full audit trail.
+## How It Works
 
-## Quick Start
-
-```bash
-npm install
-cp .env.example .env
-# Edit .env with your AGENTGATE_REST_KEY
-
-# Run unit tests (no AgentGate needed)
-npm test
-
-# Run the CLI
-npx tsx src/cli.ts --help
-```
-
-## CLI Commands
-
-```bash
-# Human: create a delegation
-npx tsx src/cli.ts delegate \
-  --to <agent-public-key> \
-  --actions email-rewrite,file-transform \
-  --max-actions 3 \
-  --max-exposure 83 \
-  --max-total-exposure 250 \
-  --bond 100 \
-  --ttl 3600 \
-  --description "Rewrite up to 3 emails, max 83 cents exposure each"
-
-# Agent: accept a delegation
-npx tsx src/cli.ts accept --delegation <id> --bond 100
-
-# Agent: act under delegation
-npx tsx src/cli.ts act \
-  --delegation <id> \
-  --action-type email-rewrite \
-  --exposure 83 \
-  --payload '{"instruction": "make it formal"}'
-
-# Resolver: resolve an action (success, failed, or malicious)
-npx tsx src/cli.ts resolve --action <id> --outcome success
-
-# Human: revoke or close
-npx tsx src/cli.ts revoke --delegation <id>
-npx tsx src/cli.ts close --delegation <id>
-
-# Anyone: view full accountability trail
-npx tsx src/cli.ts status --delegation <id>
-```
-
-## Delegation Lifecycle
-
-1. **Human creates delegation** — defines scope, locks commitment bond in AgentGate
+1. **Human creates delegation** — defines scope (allowed actions, exposure limits, time bounds), locks a commitment bond on AgentGate
 2. **Agent accepts** — posts its own bond (two-phase: claim → bond → finalize)
 3. **Agent acts within scope** — scope validated locally with AgentGate-aligned 1.2× capacity math
 4. **Resolver resolves** — each action settled via AgentGate
 5. **Delegation completes** — aggregate outcome computed, bonds released or slashed
 
-## State Machine
+## What's Implemented
 
-Six operational states with terminal reason separation:
+- 6-state machine: pending → accepted → active → settling → completed (+ failed)
+- Terminal reason separation: exhausted, closed, revoked, expired
+- Two-phase transaction pattern (no SQLite locks across HTTP calls)
+- Zod-validated delegation scope with capacity math
+- Dual bond mechanics (human commitment deposit + agent action bond)
+- CLI with 7 commands: delegate, accept, act, resolve, revoke, close, status
+- Ed25519 signed requests for human, agent, and resolver roles
+- Bond TTL alignment (human bond = delegation TTL + 1hr margin)
+- Auto-complete on scope exhaustion
+- Crash recovery for orphaned action reservations
 
-| State | Meaning |
-|---|---|
-| `pending` | Waiting for agent to accept |
-| `accepted` | Agent accepted, no actions yet |
-| `active` | At least one action executed |
-| `settling` | No new actions, open actions still resolving |
-| `completed` | Terminal — all obligations resolved |
-| `failed` | Terminal — unrecoverable system error |
-
-Terminal reasons: `exhausted`, `closed`, `revoked`, `expired`
-
-## Testing
+## Quick Start
 
 ```bash
-# Unit tests (no external dependencies)
-npm test
+# 1. Start AgentGate
+cd ~/Desktop/projects/agentgate && npm run restart
 
-# Integration tests (requires AgentGate running)
-# 1. Start AgentGate: cd ~/Desktop/projects/agentgate && npm run restart
-# 2. Ensure .env has AGENTGATE_REST_KEY
-# 3. Run: npm test
-# Integration tests auto-skip when AgentGate is unavailable.
+# 2. Run Delegation Proof
+cd ~/Desktop/projects/delegation-identity-proof
+cp .env.example .env  # add AGENTGATE_REST_KEY
+npm install
+
+# Create a delegation
+npx tsx src/cli.ts delegate --max-actions 5 --max-exposure 500 --ttl 3600
+
+# Agent accepts
+npx tsx src/cli.ts accept --delegation-id <id>
+
+# Agent acts
+npx tsx src/cli.ts act --delegation-id <id> --action "file-transform" --exposure 100
+
+# Check status
+npx tsx src/cli.ts status --delegation-id <id>
 ```
 
-## Tech Stack
+## Scope / Non-Goals (v0.1)
 
-- TypeScript, Node.js 20+, tsx
-- Vitest for testing
-- Zod for validation
-- better-sqlite3 for local SQLite storage
-- Ed25519 signing via AgentGate client pattern
-- AgentGate REST API
+- Human bond is a commitment deposit, not slashable (v0.2)
+- Scope enforcement is client-side only — a malicious agent with direct API access can bypass (v0.2)
+- Payload convention in AgentGate is unenforceable (opaque)
+- Bond TTL ceiling of 24 hours
+- No protection against human grief-revoke attacks (v0.2)
+- Single-hop delegation only — no recursive chain-of-custody (v0.2)
 
-## Known Limitations (v0.1)
+## Tests
 
-1. Human bond is a commitment deposit, not slashable (v0.2)
-2. Scope enforcement is client-side only (v0.2)
-3. Payload convention in AgentGate is unenforceable
-4. Bond TTL ceiling of 24 hours
-5. No protection against human grief-revoke attacks (v0.2)
+88 tests across 7 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
 
-See the [v0.1 spec](DELEGATION_IDENTITY_PROOF_v0.1_SPEC_REV3.md) for full details.
+```bash
+npm test
+```
+
+## Related Projects
+
+- [AgentGate](https://github.com/selfradiance/agentgate) — the core execution engine
+- [MCP Firewall](https://github.com/selfradiance/agentgate-mcp-firewall) — governance proxy for MCP tool calls
+
+## Status
+
+Complete — v0.1.0 shipped. Triple-audited (Claude Code 8-round + Codex cold-eyes + Claude Code cross-verification). 88 tests.
 
 ## License
 
