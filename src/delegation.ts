@@ -318,6 +318,36 @@ export type CheckpointExecuteHandoffResult =
       message: string;
     };
 
+export type CheckpointForwardResolutionNotReadyCode =
+  | "NOT_FOUND"
+  | "NOT_FORWARDED"
+  | "AGENTGATE_ACTION_NOT_ATTACHED"
+  | "ALREADY_FINALIZED"
+  | "PRE_ATTACHMENT_FAILED";
+
+export type CheckpointForwardResolutionResult =
+  | {
+      ok: true;
+      stage: "finalized";
+      reservationId: string;
+      agentgateActionId: string;
+      outcome: CheckpointForwardFinalOutcome;
+    }
+  | {
+      ok: false;
+      stage: "not_ready";
+      reservationId: string;
+      code: CheckpointForwardResolutionNotReadyCode;
+    }
+  | {
+      ok: false;
+      stage: "resolution_failed";
+      reservationId: string;
+      agentgateActionId: string;
+      code: "AGENTGATE_RESOLVE_FAILED";
+      message: string;
+    };
+
 export interface CheckpointPreparedExecuteInput {
   reservationId: string;
   delegationId: string;
@@ -1136,6 +1166,100 @@ export async function executeCheckpointForwardHandoff(
       message: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+export async function resolveCheckpointForwardedReservation(
+  reservationId: string,
+  outcome: CheckpointForwardFinalOutcome,
+  identityFile?: string
+): Promise<CheckpointForwardResolutionResult> {
+  if (outcome !== "success" && outcome !== "failed") {
+    throw new CheckpointForwardFinalizationError(
+      "INVALID_FINAL_OUTCOME",
+      `Unsupported checkpoint final outcome "${outcome}"`
+    );
+  }
+
+  const status = getCheckpointReservationExecutionStatus(reservationId);
+
+  if (status.status === "not_found") {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: status.reservationId,
+      code: "NOT_FOUND",
+    };
+  }
+
+  if (status.status === "pending_forward" || status.status === "in_forward") {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: status.reservationId,
+      code: "NOT_FORWARDED",
+    };
+  }
+
+  if (status.status === "pre_attachment_failed") {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: status.reservationId,
+      code: "PRE_ATTACHMENT_FAILED",
+    };
+  }
+
+  if (
+    status.status === "finalized_success" ||
+    status.status === "finalized_failed"
+  ) {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: status.reservationId,
+      code: "ALREADY_FINALIZED",
+    };
+  }
+
+  if (status.agentgateActionId === null) {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: status.reservationId,
+      code: "AGENTGATE_ACTION_NOT_ATTACHED",
+    };
+  }
+
+  const keys = agentGateClient.loadOrCreateKeypair(identityFile);
+  const resolverId = await agentGateClient.createIdentity(keys, identityFile);
+
+  try {
+    await agentGateClient.resolveAgentGateAction(
+      keys,
+      resolverId,
+      status.agentgateActionId,
+      outcome
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      stage: "resolution_failed",
+      reservationId: status.reservationId,
+      agentgateActionId: status.agentgateActionId,
+      code: "AGENTGATE_RESOLVE_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  finalizeCheckpointForwardedAction(reservationId, outcome);
+
+  return {
+    ok: true,
+    stage: "finalized",
+    reservationId: status.reservationId,
+    agentgateActionId: status.agentgateActionId,
+    outcome,
+  };
 }
 
 export function startCheckpointForwardAttempt(

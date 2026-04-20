@@ -33,6 +33,7 @@ import {
   isCheckpointReservationExecuteEligible,
   prepareCheckpointExecuteInput,
   prepareFinalCheckpointAgentGateExecuteBody,
+  resolveCheckpointForwardedReservation,
   resolveAction,
   revokeDelegation,
   closeDelegation,
@@ -56,6 +57,7 @@ const TEST_SCOPE: DelegationScope = {
   description: "Test delegation scope",
 };
 const TEST_CHECKPOINT_IDENTITY_FILE = "test-checkpoint-execute-identity.json";
+const TEST_RESOLVER_IDENTITY_FILE = "test-checkpoint-resolver-identity.json";
 
 function makeTestDelegation(overrides?: Partial<{
   ttlSeconds: number;
@@ -80,6 +82,9 @@ afterEach(() => {
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_CHECKPOINT_IDENTITY_FILE)) {
     fs.unlinkSync(TEST_CHECKPOINT_IDENTITY_FILE);
+  }
+  if (fs.existsSync(TEST_RESOLVER_IDENTITY_FILE)) {
+    fs.unlinkSync(TEST_RESOLVER_IDENTITY_FILE);
   }
 });
 
@@ -1831,6 +1836,176 @@ describe("checkpoint execute handoff", () => {
       forwardState: CHECKPOINT_FORWARD_STATE_PENDING,
       outcome: null,
       agentgateActionId: null,
+      resolvedAt: null,
+    });
+  });
+});
+
+describe("checkpoint forward resolution bridge", () => {
+  const RESOLVER_KEYS = {
+    publicKey: "resolver-pub-key",
+    privateKey: Buffer.alloc(32, 2).toString("base64"),
+  };
+
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  function createForwardedReservation(
+    delegationId: string,
+    agentgateActionId = "ag-checkpoint-001"
+  ): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "rewrite this draft" },
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    attachCheckpointForwardedAction(
+      reservation.reservationId,
+      agentgateActionId
+    );
+
+    return reservation.reservationId;
+  }
+
+  function writeResolverIdentityFile(
+    identityId = "resolver-identity-123"
+  ): void {
+    fs.writeFileSync(
+      TEST_RESOLVER_IDENTITY_FILE,
+      JSON.stringify({
+        publicKey: RESOLVER_KEYS.publicKey,
+        privateKey: RESOLVER_KEYS.privateKey,
+        identityId,
+      })
+    );
+  }
+
+  it.each([
+    {
+      outcome: "success" as const,
+      agentgateActionId: "ag-checkpoint-001",
+      resolverId: "resolver-identity-123",
+      expectedStatus: "finalized_success" as const,
+    },
+    {
+      outcome: "failed" as const,
+      agentgateActionId: "ag-checkpoint-002",
+      resolverId: "resolver-identity-456",
+      expectedStatus: "finalized_failed" as const,
+    },
+  ])(
+    "resolves $outcome through AgentGate and finalizes locally",
+    async ({ outcome, agentgateActionId, resolverId, expectedStatus }) => {
+      const d = makeTestDelegation();
+      acceptDelegation(d.id);
+      const reservationId = createForwardedReservation(d.id, agentgateActionId);
+      writeResolverIdentityFile(resolverId);
+
+      const resolveSpy = vi
+        .spyOn(agentGateClient, "resolveAgentGateAction")
+        .mockResolvedValue({ ok: true });
+
+      await expect(
+        resolveCheckpointForwardedReservation(
+          reservationId,
+          outcome,
+          TEST_RESOLVER_IDENTITY_FILE
+        )
+      ).resolves.toEqual({
+        ok: true,
+        stage: "finalized",
+        reservationId,
+        agentgateActionId,
+        outcome,
+      });
+
+      expect(resolveSpy).toHaveBeenCalledWith(
+        RESOLVER_KEYS,
+        resolverId,
+        agentgateActionId,
+        outcome
+      );
+
+      expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+        status: expectedStatus,
+        reservationId,
+        forwardState: CHECKPOINT_FORWARD_STATE_FORWARDED,
+        outcome,
+        agentgateActionId,
+        resolvedAt: expect.any(String),
+      });
+    }
+  );
+
+  it("rejects a non-forwarded reservation", async () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "draft" },
+      declaredExposureCents: 50,
+    }).reservationId;
+
+    const resolveSpy = vi
+      .spyOn(agentGateClient, "resolveAgentGateAction")
+      .mockResolvedValue({ ok: true });
+
+    await expect(
+      resolveCheckpointForwardedReservation(
+        reservationId,
+        "success",
+        TEST_RESOLVER_IDENTITY_FILE
+      )
+    ).resolves.toEqual({
+      ok: false,
+      stage: "not_ready",
+      reservationId,
+      code: "NOT_FORWARDED",
+    });
+
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces AgentGate resolution failure cleanly without orchestration", async () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+    writeResolverIdentityFile();
+
+    const resolveSpy = vi
+      .spyOn(agentGateClient, "resolveAgentGateAction")
+      .mockRejectedValue(new Error("AgentGate resolution failed"));
+
+    await expect(
+      resolveCheckpointForwardedReservation(
+        reservationId,
+        "success",
+        TEST_RESOLVER_IDENTITY_FILE
+      )
+    ).resolves.toEqual({
+      ok: false,
+      stage: "resolution_failed",
+      reservationId,
+      agentgateActionId: "ag-checkpoint-001",
+      code: "AGENTGATE_RESOLVE_FAILED",
+      message: "AgentGate resolution failed",
+    });
+
+    expect(resolveSpy).toHaveBeenCalledTimes(1);
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "forwarded",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_FORWARDED,
+      outcome: null,
+      agentgateActionId: "ag-checkpoint-001",
       resolvedAt: null,
     });
   });
