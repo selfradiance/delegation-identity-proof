@@ -1,11 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { closeDb, getDb } from "../src/db";
 import {
+  CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+  CHECKPOINT_FORWARD_STATE_PENDING,
+  CheckpointForwardTransitionError,
   createDelegation,
   getDelegation,
   claimForAccept,
   finalizeAccept,
   revertAccept,
+  reserveCheckpointAction,
   reserveAction,
   finalizeAction,
   revertAction,
@@ -14,9 +18,11 @@ import {
   closeDelegation,
   checkExpiry,
   computeOutcome,
+  getCheckpointReservationForwardStatus,
   recoverTransientStates,
   getActions,
   getEvents,
+  startCheckpointForwardAttempt,
   type DelegationRow,
 } from "../src/delegation";
 import type { DelegationScope } from "../src/scope";
@@ -367,6 +373,113 @@ describe("resolveAction", () => {
     const events = getEvents(delegationId);
     const resolved = events.find((e) => e.event_type === "action_resolved");
     expect(resolved).toBeDefined();
+  });
+});
+
+describe("checkpoint forward transition", () => {
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  it("transitions an eligible checkpoint reservation from pending_forward to in_forward", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    expect(getCheckpointReservationForwardStatus(reservation.reservationId)).toEqual({
+      action: expect.objectContaining({
+        id: reservation.reservationId,
+        forward_state: CHECKPOINT_FORWARD_STATE_PENDING,
+      }),
+      eligible: true,
+    });
+
+    const updated = startCheckpointForwardAttempt(reservation.reservationId);
+
+    expect(updated.forward_state).toBe(CHECKPOINT_FORWARD_STATE_IN_FORWARD);
+    expect(getCheckpointReservationForwardStatus(reservation.reservationId)).toEqual({
+      action: expect.objectContaining({
+        id: reservation.reservationId,
+        forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      }),
+      eligible: false,
+    });
+  });
+
+  it("rejects a second forward transition attempt on the same reservation", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+
+    expect(() => startCheckpointForwardAttempt(reservation.reservationId)).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointForwardTransitionError",
+        code: "RESERVATION_NOT_FORWARDABLE",
+      })
+    );
+  });
+
+  it("rejects a reservation that is not eligible for checkpoint forward", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const result = reserveAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in result)) throw new Error("Expected reservation");
+
+    try {
+      startCheckpointForwardAttempt(result.actionId);
+      throw new Error("Expected forward transition to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(CheckpointForwardTransitionError);
+      expect((error as CheckpointForwardTransitionError).code).toBe(
+        "RESERVATION_NOT_FORWARDABLE"
+      );
+    }
+  });
+
+  it("logs checkpoint_forward_started once on a successful transition", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+
+    const forwardStartedEvents = getEvents(d.id).filter(
+      (event) => event.event_type === "checkpoint_forward_started"
+    );
+
+    expect(forwardStartedEvents).toHaveLength(1);
+    expect(JSON.parse(forwardStartedEvents[0].detail_json ?? "{}")).toEqual({
+      reservation_id: reservation.reservationId,
+      from_forward_state: CHECKPOINT_FORWARD_STATE_PENDING,
+      forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+    });
   });
 });
 

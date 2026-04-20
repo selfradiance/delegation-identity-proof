@@ -33,7 +33,10 @@ export type DelegationOutcome =
 
 export type ActionOutcome = "success" | "failed" | "malicious";
 export const CHECKPOINT_FORWARD_STATE_PENDING = "pending_forward" as const;
-export type CheckpointForwardState = typeof CHECKPOINT_FORWARD_STATE_PENDING;
+export const CHECKPOINT_FORWARD_STATE_IN_FORWARD = "in_forward" as const;
+export type CheckpointForwardState =
+  | typeof CHECKPOINT_FORWARD_STATE_PENDING
+  | typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD;
 
 export interface DelegationRow {
   id: string;
@@ -270,6 +273,25 @@ export class CheckpointReservationError extends Error {
   }
 }
 
+export class CheckpointForwardTransitionError extends Error {
+  code:
+    | "RESERVATION_NOT_FOUND"
+    | "RESERVATION_NOT_FORWARDABLE"
+    | "FORWARD_TRANSITION_FAILED";
+
+  constructor(
+    code:
+      | "RESERVATION_NOT_FOUND"
+      | "RESERVATION_NOT_FORWARDABLE"
+      | "FORWARD_TRANSITION_FAILED",
+    message: string
+  ) {
+    super(message);
+    this.name = "CheckpointForwardTransitionError";
+    this.code = code;
+  }
+}
+
 export function reserveCheckpointAction(
   params: CheckpointReservationParams
 ): CheckpointReservationResult {
@@ -408,6 +430,76 @@ export function getCheckpointReservationForwardStatus(
       action.agentgate_action_id === null &&
       action.outcome === null,
   };
+}
+
+export function startCheckpointForwardAttempt(
+  reservationId: string
+): DelegationActionRow {
+  const db = getDb();
+  const startForward = db.transaction((txReservationId: string) => {
+    const action = db
+      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+      .get(txReservationId) as DelegationActionRow | undefined;
+
+    if (!action) {
+      throw new CheckpointForwardTransitionError(
+        "RESERVATION_NOT_FOUND",
+        "Checkpoint reservation not found"
+      );
+    }
+
+    const eligible =
+      action.forward_state === CHECKPOINT_FORWARD_STATE_PENDING &&
+      action.agentgate_action_id === null &&
+      action.outcome === null;
+
+    if (!eligible) {
+      throw new CheckpointForwardTransitionError(
+        "RESERVATION_NOT_FORWARDABLE",
+        "Checkpoint reservation is not eligible to start a forward attempt"
+      );
+    }
+
+    const result = db.prepare(
+      `UPDATE delegation_actions
+       SET forward_state = ?
+       WHERE id = ? AND forward_state = ? AND agentgate_action_id IS NULL AND outcome IS NULL`
+    ).run(
+      CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      txReservationId,
+      CHECKPOINT_FORWARD_STATE_PENDING
+    );
+
+    if (result.changes !== 1) {
+      throw new CheckpointForwardTransitionError(
+        "FORWARD_TRANSITION_FAILED",
+        "Failed to start checkpoint forward attempt"
+      );
+    }
+
+    logEvent(action.delegation_id, "checkpoint_forward_started", {
+      reservation_id: txReservationId,
+      from_forward_state: CHECKPOINT_FORWARD_STATE_PENDING,
+      forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+    });
+
+    return db
+      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+      .get(txReservationId) as DelegationActionRow;
+  });
+
+  try {
+    return startForward.immediate(reservationId);
+  } catch (error) {
+    if (error instanceof CheckpointForwardTransitionError) {
+      throw error;
+    }
+
+    throw new CheckpointForwardTransitionError(
+      "FORWARD_TRANSITION_FAILED",
+      "Failed to start checkpoint forward attempt"
+    );
+  }
 }
 
 /**
