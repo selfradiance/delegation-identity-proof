@@ -5,13 +5,23 @@ import {
   ExecuteDelegationRequestSchema,
   formatSchemaIssue,
 } from "./checkpoint-schema";
+import { getDelegation } from "./delegation";
+import {
+  verifyCheckpointRequestSignature,
+  type CheckpointSignableRequest,
+} from "./checkpoint-auth";
 
 export type CheckpointErrorCode =
   | "NOT_FOUND"
   | "METHOD_NOT_ALLOWED"
   | "INVALID_JSON"
   | "INVALID_DELEGATION_ID"
-  | "INVALID_REQUEST";
+  | "INVALID_REQUEST"
+  | "DELEGATION_NOT_FOUND"
+  | "DELEGATION_NOT_ACTIVE"
+  | "DELEGATE_MISMATCH"
+  | "TIMESTAMP_OUT_OF_WINDOW"
+  | "INVALID_SIGNATURE";
 
 interface CheckpointErrorResponse {
   ok: false;
@@ -21,7 +31,7 @@ interface CheckpointErrorResponse {
 
 interface CheckpointSuccessResponse {
   ok: true;
-  stage: "validated";
+  stage: "authenticated";
   delegationId: string;
   actionType: string;
 }
@@ -29,6 +39,7 @@ interface CheckpointSuccessResponse {
 type CheckpointResponse = CheckpointErrorResponse | CheckpointSuccessResponse;
 
 const EXECUTE_ROUTE_PATTERN = /^\/v1\/delegations\/([^/]+)\/execute$/;
+const TIMESTAMP_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
 
 function sendJson(
   res: ServerResponse,
@@ -63,6 +74,33 @@ function buildInvalidRequestMessage(message: string, fieldPath?: string): string
   }
 
   return `${fieldPath}: ${message}`;
+}
+
+function canAcceptDelegatedExecution(
+  status: string,
+  expiresAt: string,
+  nowMs: number
+): { ok: true } | { ok: false; message: string } {
+  if (status !== "accepted" && status !== "active") {
+    return {
+      ok: false,
+      message: `Delegation status "${status}" cannot accept delegated execution`,
+    };
+  }
+
+  if (Date.parse(expiresAt) <= nowMs) {
+    return {
+      ok: false,
+      message: "Delegation has expired",
+    };
+  }
+
+  return { ok: true };
+}
+
+function isTimestampWithinFreshnessWindow(timestamp: string, nowMs: number): boolean {
+  const parsed = Date.parse(timestamp);
+  return Math.abs(nowMs - parsed) <= TIMESTAMP_FRESHNESS_WINDOW_MS;
 }
 
 export async function handleCheckpointRequest(
@@ -132,9 +170,76 @@ export async function handleCheckpointRequest(
     return;
   }
 
+  const delegation = getDelegation(pathResult.data.delegationId);
+  if (!delegation) {
+    sendJson(res, 404, {
+      ok: false,
+      code: "DELEGATION_NOT_FOUND",
+      message: "Delegation not found",
+    });
+    return;
+  }
+
+  const nowMs = Date.now();
+  const activeCheck = canAcceptDelegatedExecution(
+    delegation.status,
+    delegation.expires_at,
+    nowMs
+  );
+  if (!activeCheck.ok) {
+    sendJson(res, 409, {
+      ok: false,
+      code: "DELEGATION_NOT_ACTIVE",
+      message: activeCheck.message,
+    });
+    return;
+  }
+
+  if (requestResult.data.auth.delegateId !== delegation.delegate_id) {
+    sendJson(res, 403, {
+      ok: false,
+      code: "DELEGATE_MISMATCH",
+      message: "auth.delegateId does not match the bound delegate identity",
+    });
+    return;
+  }
+
+  if (!isTimestampWithinFreshnessWindow(requestResult.data.auth.timestamp, nowMs)) {
+    sendJson(res, 403, {
+      ok: false,
+      code: "TIMESTAMP_OUT_OF_WINDOW",
+      message: "auth.timestamp is outside the allowed freshness window",
+    });
+    return;
+  }
+
+  const signableRequest: CheckpointSignableRequest = {
+    delegationId: pathResult.data.delegationId,
+    delegateId: requestResult.data.auth.delegateId,
+    actionType: requestResult.data.actionType,
+    declaredExposureCents: requestResult.data.declaredExposureCents,
+    payload: requestResult.data.payload,
+    timestamp: requestResult.data.auth.timestamp,
+  };
+
+  if (
+    !verifyCheckpointRequestSignature(
+      signableRequest,
+      requestResult.data.auth.signature,
+      delegation.delegate_id
+    )
+  ) {
+    sendJson(res, 403, {
+      ok: false,
+      code: "INVALID_SIGNATURE",
+      message: "auth.signature did not verify for the bound delegate identity",
+    });
+    return;
+  }
+
   sendJson(res, 200, {
     ok: true,
-    stage: "validated",
+    stage: "authenticated",
     delegationId: pathResult.data.delegationId,
     actionType: requestResult.data.actionType,
   });
