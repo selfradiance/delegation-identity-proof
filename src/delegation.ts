@@ -34,9 +34,11 @@ export type DelegationOutcome =
 export type ActionOutcome = "success" | "failed" | "malicious";
 export const CHECKPOINT_FORWARD_STATE_PENDING = "pending_forward" as const;
 export const CHECKPOINT_FORWARD_STATE_IN_FORWARD = "in_forward" as const;
+export const CHECKPOINT_FORWARD_STATE_FORWARDED = "forwarded" as const;
 export type CheckpointForwardState =
   | typeof CHECKPOINT_FORWARD_STATE_PENDING
-  | typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD;
+  | typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD
+  | typeof CHECKPOINT_FORWARD_STATE_FORWARDED;
 
 export interface DelegationRow {
   id: string;
@@ -292,6 +294,27 @@ export class CheckpointForwardTransitionError extends Error {
   }
 }
 
+export class CheckpointForwardAttachmentError extends Error {
+  code:
+    | "RESERVATION_NOT_FOUND"
+    | "RESERVATION_NOT_IN_FORWARD"
+    | "AGENTGATE_ACTION_ALREADY_ATTACHED"
+    | "FORWARD_ATTACHMENT_FAILED";
+
+  constructor(
+    code:
+      | "RESERVATION_NOT_FOUND"
+      | "RESERVATION_NOT_IN_FORWARD"
+      | "AGENTGATE_ACTION_ALREADY_ATTACHED"
+      | "FORWARD_ATTACHMENT_FAILED",
+    message: string
+  ) {
+    super(message);
+    this.name = "CheckpointForwardAttachmentError";
+    this.code = code;
+  }
+}
+
 export function reserveCheckpointAction(
   params: CheckpointReservationParams
 ): CheckpointReservationResult {
@@ -498,6 +521,83 @@ export function startCheckpointForwardAttempt(
     throw new CheckpointForwardTransitionError(
       "FORWARD_TRANSITION_FAILED",
       "Failed to start checkpoint forward attempt"
+    );
+  }
+}
+
+export function attachCheckpointForwardedAction(
+  reservationId: string,
+  agentgateActionId: string
+): DelegationActionRow {
+  const db = getDb();
+  const attachForwardedAction = db.transaction(
+    (txReservationId: string, txAgentgateActionId: string) => {
+      const action = db
+        .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+        .get(txReservationId) as DelegationActionRow | undefined;
+
+      if (!action) {
+        throw new CheckpointForwardAttachmentError(
+          "RESERVATION_NOT_FOUND",
+          "Checkpoint reservation not found"
+        );
+      }
+
+      if (action.agentgate_action_id !== null) {
+        throw new CheckpointForwardAttachmentError(
+          "AGENTGATE_ACTION_ALREADY_ATTACHED",
+          "Checkpoint reservation already has an attached AgentGate action id"
+        );
+      }
+
+      if (action.forward_state !== CHECKPOINT_FORWARD_STATE_IN_FORWARD) {
+        throw new CheckpointForwardAttachmentError(
+          "RESERVATION_NOT_IN_FORWARD",
+          "Checkpoint reservation is not currently in_forward"
+        );
+      }
+
+      const result = db.prepare(
+        `UPDATE delegation_actions
+         SET agentgate_action_id = ?, forward_state = ?
+         WHERE id = ? AND forward_state = ? AND agentgate_action_id IS NULL AND outcome IS NULL`
+      ).run(
+        txAgentgateActionId,
+        CHECKPOINT_FORWARD_STATE_FORWARDED,
+        txReservationId,
+        CHECKPOINT_FORWARD_STATE_IN_FORWARD
+      );
+
+      if (result.changes !== 1) {
+        throw new CheckpointForwardAttachmentError(
+          "FORWARD_ATTACHMENT_FAILED",
+          "Failed to attach AgentGate action id to checkpoint reservation"
+        );
+      }
+
+      logEvent(action.delegation_id, "checkpoint_forward_attached", {
+        reservation_id: txReservationId,
+        agentgate_action_id: txAgentgateActionId,
+        from_forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+        forward_state: CHECKPOINT_FORWARD_STATE_FORWARDED,
+      });
+
+      return db
+        .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+        .get(txReservationId) as DelegationActionRow;
+    }
+  );
+
+  try {
+    return attachForwardedAction.immediate(reservationId, agentgateActionId);
+  } catch (error) {
+    if (error instanceof CheckpointForwardAttachmentError) {
+      throw error;
+    }
+
+    throw new CheckpointForwardAttachmentError(
+      "FORWARD_ATTACHMENT_FAILED",
+      "Failed to attach AgentGate action id to checkpoint reservation"
     );
   }
 }

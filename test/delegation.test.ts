@@ -1,8 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { closeDb, getDb } from "../src/db";
 import {
+  attachCheckpointForwardedAction,
+  CHECKPOINT_FORWARD_STATE_FORWARDED,
   CHECKPOINT_FORWARD_STATE_IN_FORWARD,
   CHECKPOINT_FORWARD_STATE_PENDING,
+  CheckpointForwardAttachmentError,
   CheckpointForwardTransitionError,
   createDelegation,
   getDelegation,
@@ -480,6 +483,121 @@ describe("checkpoint forward transition", () => {
       from_forward_state: CHECKPOINT_FORWARD_STATE_PENDING,
       forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
     });
+  });
+});
+
+describe("checkpoint forward attachment", () => {
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  function createInForwardReservation(delegationId: string): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    return reservation.reservationId;
+  }
+
+  it("attaches one AgentGate action id to an in_forward reservation", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createInForwardReservation(d.id);
+
+    const attached = attachCheckpointForwardedAction(
+      reservationId,
+      "ag-checkpoint-001"
+    );
+
+    expect(attached.id).toBe(reservationId);
+    expect(attached.forward_state).toBe(CHECKPOINT_FORWARD_STATE_FORWARDED);
+    expect(attached.agentgate_action_id).toBe("ag-checkpoint-001");
+    expect(getCheckpointReservationForwardStatus(reservationId)).toEqual({
+      action: expect.objectContaining({
+        id: reservationId,
+        forward_state: CHECKPOINT_FORWARD_STATE_FORWARDED,
+        agentgate_action_id: "ag-checkpoint-001",
+      }),
+      eligible: false,
+    });
+  });
+
+  it("writes checkpoint_forward_attached once on successful attachment", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createInForwardReservation(d.id);
+
+    attachCheckpointForwardedAction(reservationId, "ag-checkpoint-001");
+
+    const attachedEvents = getEvents(d.id).filter(
+      (event) => event.event_type === "checkpoint_forward_attached"
+    );
+
+    expect(attachedEvents).toHaveLength(1);
+    expect(JSON.parse(attachedEvents[0].detail_json ?? "{}")).toEqual({
+      reservation_id: reservationId,
+      agentgate_action_id: "ag-checkpoint-001",
+      from_forward_state: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      forward_state: CHECKPOINT_FORWARD_STATE_FORWARDED,
+    });
+  });
+
+  it("rejects attaching a second AgentGate action id", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createInForwardReservation(d.id);
+
+    attachCheckpointForwardedAction(reservationId, "ag-checkpoint-001");
+
+    expect(() =>
+      attachCheckpointForwardedAction(reservationId, "ag-checkpoint-002")
+    ).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointForwardAttachmentError",
+        code: "AGENTGATE_ACTION_ALREADY_ATTACHED",
+      })
+    );
+  });
+
+  it("rejects attaching from pending_forward", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    try {
+      attachCheckpointForwardedAction(
+        reservation.reservationId,
+        "ag-checkpoint-001"
+      );
+      throw new Error("Expected attachment to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(CheckpointForwardAttachmentError);
+      expect((error as CheckpointForwardAttachmentError).code).toBe(
+        "RESERVATION_NOT_IN_FORWARD"
+      );
+    }
+  });
+
+  it("rejects attaching a nonexistent reservation", () => {
+    expect(() =>
+      attachCheckpointForwardedAction("missing", "ag-checkpoint-001")
+    ).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointForwardAttachmentError",
+        code: "RESERVATION_NOT_FOUND",
+      })
+    );
   });
 });
 
