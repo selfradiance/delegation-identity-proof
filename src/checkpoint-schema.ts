@@ -14,6 +14,13 @@ export const ExecuteDelegationPathParamsSchema = z
   })
   .strict();
 
+export const FinalizeDelegationActionPathParamsSchema = z
+  .object({
+    delegationId: z.string().uuid(),
+    reservationId: z.string().uuid(),
+  })
+  .strict();
+
 export const ExecuteDelegationAuthSchema = z
   .object({
     delegateId: Base64StringSchema,
@@ -34,11 +41,23 @@ export const ExecuteDelegationRequestSchema = z
   })
   .strict();
 
+export const FinalizeDelegationActionRequestSchema = z
+  .object({
+    outcome: z.enum(["success", "failed"]),
+  })
+  .strict();
+
 export type ExecuteDelegationPathParams = z.infer<
   typeof ExecuteDelegationPathParamsSchema
 >;
+export type FinalizeDelegationActionPathParams = z.infer<
+  typeof FinalizeDelegationActionPathParamsSchema
+>;
 export type ExecuteDelegationRequest = z.infer<
   typeof ExecuteDelegationRequestSchema
+>;
+export type FinalizeDelegationActionRequest = z.infer<
+  typeof FinalizeDelegationActionRequestSchema
 >;
 
 export function formatSchemaIssue(issuePath: (string | number)[]): string {

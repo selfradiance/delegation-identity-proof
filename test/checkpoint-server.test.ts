@@ -7,14 +7,19 @@ import * as agentGateClient from "../src/agentgate-client";
 import { createCheckpointServer } from "../src/checkpoint-server";
 import { closeDb, getDb } from "../src/db";
 import {
+  attachCheckpointForwardedAction,
   CHECKPOINT_FORWARD_STATE_FORWARDED,
   CHECKPOINT_FORWARD_STATE_IN_FORWARD,
   claimForAccept,
   createDelegation,
   finalizeAccept,
+  finalizeCheckpointForwardedAction,
   getActions,
+  getDelegation,
   getCheckpointReservationForwardStatus,
   getEvents,
+  reserveCheckpointAction,
+  startCheckpointForwardAttempt,
   type DelegationRow,
 } from "../src/delegation";
 import {
@@ -34,6 +39,8 @@ const VALID_REQUEST_TEMPLATE = {
 const serversToClose = new Set<Server>();
 const TEST_CHECKPOINT_AGENT_IDENTITY_FILE =
   "test-checkpoint-agent-execute-identity.json";
+const TEST_CHECKPOINT_RESOLVER_IDENTITY_FILE =
+  "test-checkpoint-resolver-identity.json";
 
 function base64UrlToBase64(value: string): string {
   return Buffer.from(value, "base64url").toString("base64");
@@ -164,8 +171,12 @@ afterEach(async () => {
   closeDb();
   delete process.env.DELEGATION_DB_PATH;
   delete process.env.AGENT_IDENTITY_FILE;
+  delete process.env.CHECKPOINT_RESOLVER_IDENTITY_FILE;
   if (fs.existsSync(TEST_CHECKPOINT_AGENT_IDENTITY_FILE)) {
     fs.unlinkSync(TEST_CHECKPOINT_AGENT_IDENTITY_FILE);
+  }
+  if (fs.existsSync(TEST_CHECKPOINT_RESOLVER_IDENTITY_FILE)) {
+    fs.unlinkSync(TEST_CHECKPOINT_RESOLVER_IDENTITY_FILE);
   }
   vi.restoreAllMocks();
 });
@@ -190,6 +201,19 @@ function getCheckpointReservedEvents(delegationId: string) {
   return getEvents(delegationId).filter(
     (event) => event.event_type === "checkpoint_action_reserved"
   );
+}
+
+function writeResolverIdentityFile(identityId = "resolver-identity-123") {
+  fs.writeFileSync(
+    TEST_CHECKPOINT_RESOLVER_IDENTITY_FILE,
+    JSON.stringify({
+      publicKey: "resolver-pub-key",
+      privateKey: Buffer.alloc(32, 2).toString("base64"),
+      identityId,
+    })
+  );
+  process.env.CHECKPOINT_RESOLVER_IDENTITY_FILE =
+    TEST_CHECKPOINT_RESOLVER_IDENTITY_FILE;
 }
 
 describe("checkpoint server — execute endpoint", () => {
@@ -1047,5 +1071,195 @@ describe("checkpoint server — execute endpoint", () => {
       code: "INVALID_DELEGATION_ID",
       message: "delegationId: Invalid uuid",
     });
+  });
+});
+
+describe("checkpoint server — finalize endpoint", () => {
+  function createForwardedReservation(
+    delegationId: string,
+    agentgateActionId = "ag-checkpoint-001"
+  ): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: getDelegation(delegationId)!.delegate_id,
+      actionType: "email-rewrite",
+      payload: { input: "Please rewrite this email" },
+      declaredExposureCents: 83,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    attachCheckpointForwardedAction(
+      reservation.reservationId,
+      agentgateActionId
+    );
+
+    return reservation.reservationId;
+  }
+
+  it("finalizes a forwarded checkpoint reservation as success through the explicit endpoint", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const reservationId = createForwardedReservation(delegation.id);
+    const { baseUrl } = await startServer();
+    writeResolverIdentityFile();
+
+    vi.spyOn(agentGateClient, "resolveAgentGateAction").mockResolvedValue({
+      ok: true,
+    });
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "success" }),
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      stage: "finalized",
+      reservationId,
+      agentgateActionId: "ag-checkpoint-001",
+      outcome: "success",
+    });
+
+    const action = getActions(delegation.id)[0];
+    expect(action.forward_state).toBe(CHECKPOINT_FORWARD_STATE_FORWARDED);
+    expect(action.agentgate_action_id).toBe("ag-checkpoint-001");
+    expect(action.outcome).toBe("success");
+    expect(action.resolved_at).not.toBeNull();
+  });
+
+  it("finalizes a forwarded checkpoint reservation as failed through the explicit endpoint", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const reservationId = createForwardedReservation(
+      delegation.id,
+      "ag-checkpoint-002"
+    );
+    const { baseUrl } = await startServer();
+    writeResolverIdentityFile("resolver-identity-456");
+
+    vi.spyOn(agentGateClient, "resolveAgentGateAction").mockResolvedValue({
+      ok: true,
+    });
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "failed" }),
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      ok: true,
+      stage: "finalized",
+      reservationId,
+      agentgateActionId: "ag-checkpoint-002",
+      outcome: "failed",
+    });
+
+    const action = getActions(delegation.id)[0];
+    expect(action.outcome).toBe("failed");
+    expect(action.resolved_at).not.toBeNull();
+  });
+
+  it("rejects a non-forwarded or non-attached reservation", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const reservation = reserveCheckpointAction({
+      delegationId: delegation.id,
+      actorPublicKey: delegateKeys.publicKey,
+      actionType: "email-rewrite",
+      payload: { input: "Please rewrite this email" },
+      declaredExposureCents: 83,
+    });
+    const { baseUrl } = await startServer();
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${reservation.reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "success" }),
+      }
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      ok: false,
+      stage: "not_ready",
+      code: "NOT_FORWARDED",
+      reservationId: reservation.reservationId,
+      message: "Checkpoint reservation is not currently forwarded",
+    });
+  });
+
+  it("rejects duplicate finalization", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const reservationId = createForwardedReservation(delegation.id);
+    finalizeCheckpointForwardedAction(reservationId, "success");
+    const { baseUrl } = await startServer();
+    writeResolverIdentityFile();
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "success" }),
+      }
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      ok: false,
+      stage: "not_ready",
+      code: "ALREADY_FINALIZED",
+      reservationId,
+      message: "Checkpoint reservation is already finalized",
+    });
+  });
+
+  it("surfaces AgentGate resolution failure clearly", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const reservationId = createForwardedReservation(delegation.id);
+    const { baseUrl } = await startServer();
+    writeResolverIdentityFile();
+
+    vi.spyOn(agentGateClient, "resolveAgentGateAction").mockRejectedValue(
+      new Error("AgentGate resolution failed")
+    );
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "success" }),
+      }
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({
+      ok: false,
+      stage: "resolution_failed",
+      code: "AGENTGATE_RESOLVE_FAILED",
+      reservationId,
+      message: "AgentGate resolution failed",
+    });
+
+    const action = getActions(delegation.id)[0];
+    expect(action.forward_state).toBe(CHECKPOINT_FORWARD_STATE_FORWARDED);
+    expect(action.agentgate_action_id).toBe("ag-checkpoint-001");
+    expect(action.outcome).toBeNull();
+    expect(action.resolved_at).toBeNull();
   });
 });

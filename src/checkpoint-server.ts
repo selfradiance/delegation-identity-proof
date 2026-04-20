@@ -3,14 +3,18 @@ import { URL } from "node:url";
 import {
   ExecuteDelegationPathParamsSchema,
   ExecuteDelegationRequestSchema,
+  FinalizeDelegationActionPathParamsSchema,
+  FinalizeDelegationActionRequestSchema,
   formatSchemaIssue,
 } from "./checkpoint-schema";
 import {
   CheckpointForwardTransitionError,
   CheckpointReservationError,
   executeCheckpointForwardHandoff,
+  getActions,
   getDelegation,
   reserveCheckpointAction,
+  resolveCheckpointForwardedReservation,
   startCheckpointForwardAttempt,
 } from "./delegation";
 import {
@@ -39,17 +43,22 @@ export type CheckpointErrorCode =
   | "ALREADY_FINALIZED"
   | "PRE_ATTACHMENT_FAILED"
   | "FORWARD_TRANSITION_FAILED"
-  | "AGENTGATE_EXECUTE_FAILED";
+  | "AGENTGATE_EXECUTE_FAILED"
+  | "INVALID_RESERVATION_ID"
+  | "RESERVATION_NOT_FOUND"
+  | "NOT_FORWARDED"
+  | "AGENTGATE_ACTION_NOT_ATTACHED"
+  | "AGENTGATE_RESOLVE_FAILED";
 
 interface CheckpointErrorResponse {
   ok: false;
   code: CheckpointErrorCode;
   message: string;
-  stage?: "not_ready" | "pre_attachment_failed";
+  stage?: "not_ready" | "pre_attachment_failed" | "resolution_failed";
   reservationId?: string;
 }
 
-interface CheckpointSuccessResponse {
+interface CheckpointExecuteSuccessResponse {
   ok: true;
   stage: "forwarded";
   forwardState: "forwarded";
@@ -59,9 +68,22 @@ interface CheckpointSuccessResponse {
   agentgateActionId: string;
 }
 
-type CheckpointResponse = CheckpointErrorResponse | CheckpointSuccessResponse;
+interface CheckpointFinalizeSuccessResponse {
+  ok: true;
+  stage: "finalized";
+  reservationId: string;
+  agentgateActionId: string;
+  outcome: "success" | "failed";
+}
+
+type CheckpointResponse =
+  | CheckpointErrorResponse
+  | CheckpointExecuteSuccessResponse
+  | CheckpointFinalizeSuccessResponse;
 
 const EXECUTE_ROUTE_PATTERN = /^\/v1\/delegations\/([^/]+)\/execute$/;
+const FINALIZE_ROUTE_PATTERN =
+  /^\/v1\/delegations\/([^/]+)\/actions\/([^/]+)\/finalize$/;
 const TIMESTAMP_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
 
 function sendJson(
@@ -89,6 +111,12 @@ function getExecuteRouteMatch(urlString: string | undefined): RegExpMatchArray |
   if (!urlString) return null;
   const url = new URL(urlString, "http://127.0.0.1");
   return url.pathname.match(EXECUTE_ROUTE_PATTERN);
+}
+
+function getFinalizeRouteMatch(urlString: string | undefined): RegExpMatchArray | null {
+  if (!urlString) return null;
+  const url = new URL(urlString, "http://127.0.0.1");
+  return url.pathname.match(FINALIZE_ROUTE_PATTERN);
 }
 
 function buildInvalidRequestMessage(message: string, fieldPath?: string): string {
@@ -136,18 +164,155 @@ const CHECKPOINT_NOT_READY_MESSAGES = {
     "Checkpoint reservation already failed before attachment",
 } as const;
 
+const CHECKPOINT_FINALIZE_NOT_READY_MESSAGES = {
+  NOT_FOUND: "Checkpoint reservation not found",
+  NOT_FORWARDED: "Checkpoint reservation is not currently forwarded",
+  AGENTGATE_ACTION_NOT_ATTACHED:
+    "Checkpoint reservation has no attached AgentGate action id",
+  ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
+  PRE_ATTACHMENT_FAILED:
+    "Checkpoint reservation already failed before attachment",
+} as const;
+
+async function handleCheckpointFinalizeRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  routeMatch: RegExpMatchArray
+): Promise<void> {
+  const pathResult = FinalizeDelegationActionPathParamsSchema.safeParse({
+    delegationId: decodeURIComponent(routeMatch[1]),
+    reservationId: decodeURIComponent(routeMatch[2]),
+  });
+
+  if (!pathResult.success) {
+    const issue = pathResult.error.issues[0];
+    const code =
+      issue?.path[0] === "reservationId"
+        ? "INVALID_RESERVATION_ID"
+        : "INVALID_DELEGATION_ID";
+    sendJson(res, 400, {
+      ok: false,
+      code,
+      message: buildInvalidRequestMessage(
+        issue?.message ?? "Invalid route parameter",
+        issue ? formatSchemaIssue(issue.path) : undefined
+      ),
+    });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    sendJson(res, 400, {
+      ok: false,
+      code: "INVALID_JSON",
+      message: "Request body must be valid JSON",
+    });
+    return;
+  }
+
+  const requestResult = FinalizeDelegationActionRequestSchema.safeParse(body);
+  if (!requestResult.success) {
+    const issue = requestResult.error.issues[0];
+    sendJson(res, 400, {
+      ok: false,
+      code: "INVALID_REQUEST",
+      message: buildInvalidRequestMessage(
+        issue?.message ?? "Invalid request body",
+        issue ? formatSchemaIssue(issue.path) : undefined
+      ),
+    });
+    return;
+  }
+
+  const delegation = getDelegation(pathResult.data.delegationId);
+  if (!delegation) {
+    sendJson(res, 404, {
+      ok: false,
+      code: "DELEGATION_NOT_FOUND",
+      message: "Delegation not found",
+    });
+    return;
+  }
+
+  const reservation = getActions(delegation.id).find(
+    (action) => action.id === pathResult.data.reservationId
+  );
+  if (!reservation) {
+    sendJson(res, 404, {
+      ok: false,
+      code: "RESERVATION_NOT_FOUND",
+      message: "Checkpoint reservation not found for this delegation",
+    });
+    return;
+  }
+
+  const result = await resolveCheckpointForwardedReservation(
+    pathResult.data.reservationId,
+    requestResult.data.outcome,
+    process.env.CHECKPOINT_RESOLVER_IDENTITY_FILE
+  );
+
+  if (!result.ok) {
+    if (result.stage === "not_ready") {
+      sendJson(res, result.code === "NOT_FOUND" ? 404 : 409, {
+        ok: false,
+        stage: "not_ready",
+        code: result.code,
+        reservationId: result.reservationId,
+        message: CHECKPOINT_FINALIZE_NOT_READY_MESSAGES[result.code],
+      });
+      return;
+    }
+
+    sendJson(res, 502, {
+      ok: false,
+      stage: "resolution_failed",
+      code: result.code,
+      reservationId: result.reservationId,
+      message: result.message,
+    });
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    stage: "finalized",
+    reservationId: result.reservationId,
+    agentgateActionId: result.agentgateActionId,
+    outcome: result.outcome,
+  });
+}
+
 export async function handleCheckpointRequest(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
   const routeMatch = getExecuteRouteMatch(req.url);
-
   if (!routeMatch) {
-    sendJson(res, 404, {
-      ok: false,
-      code: "NOT_FOUND",
-      message: "Route not found",
-    });
+    const finalizeRouteMatch = getFinalizeRouteMatch(req.url);
+
+    if (!finalizeRouteMatch) {
+      sendJson(res, 404, {
+        ok: false,
+        code: "NOT_FOUND",
+        message: "Route not found",
+      });
+      return;
+    }
+
+    if (req.method !== "POST") {
+      sendJson(res, 405, {
+        ok: false,
+        code: "METHOD_NOT_ALLOWED",
+        message: "Only POST is supported for this route",
+      });
+      return;
+    }
+
+    await handleCheckpointFinalizeRequest(req, res, finalizeRouteMatch);
     return;
   }
 

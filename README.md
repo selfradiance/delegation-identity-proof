@@ -33,6 +33,7 @@ AgentGate must be running for this project to work.
 - Auto-complete on scope exhaustion
 - Crash recovery for orphaned action reservations
 - v0.2 Baby Step 20: the checkpoint `POST /v1/delegations/:id/execute` path now completes the real narrow proof handoff end to end for delegated execution: local reserve, forward-start, real AgentGate execute, and local action-id attachment, with external pre-attachment failures landing in the existing failure seam
+- v0.2 Baby Step 21: the checkpoint `POST /v1/delegations/:id/actions/:reservationId/finalize` path now explicitly resolves forwarded checkpoint-managed actions through AgentGate and lands them in the existing local finalize seam
 
 ## Quick Start
 
@@ -69,7 +70,7 @@ npx tsx src/cli.ts status --delegation-id <id>
 
 ## Tests
 
-178 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
+183 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
 
 ```bash
 npm test
@@ -82,7 +83,7 @@ npm test
 
 ## Status
 
-v0.1.0 shipped and credible. v0.2 Baby Step 20 turns the checkpoint execute endpoint into a real narrow proof path for delegated execution, through local enforcement and into a real AgentGate execute call. Still no retries, async orchestration, or automatic downstream business-task completion. 178 tests.
+v0.1.0 shipped and credible. v0.2 Baby Step 21 now gives the checkpoint proof path an explicit finalize entrypoint alongside the real execute handoff, while still staying narrow: no retries, async orchestration, queues, or workflow engine. 183 tests.
 
 Planned next work: [v0.2 server-mediated scope enforcement](docs/v0.2-server-mediated-scope-enforcement.md).
 
