@@ -29,6 +29,7 @@ import {
   getCheckpointReservationExecutionStatus,
   isCheckpointReservationExecuteEligible,
   prepareCheckpointExecuteInput,
+  prepareFinalCheckpointAgentGateExecuteBody,
   resolveAction,
   revokeDelegation,
   closeDelegation,
@@ -1445,6 +1446,137 @@ describe("checkpoint AgentGate execute request finalization", () => {
       expect.objectContaining({
         name: "CheckpointExecuteRequestFinalizationError",
         code: "MISSING_BOND_ID",
+      })
+    );
+  });
+});
+
+describe("checkpoint AgentGate execute body composition", () => {
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  function createExecuteEligibleReservation(
+    delegationId: string,
+    payload: unknown = { input: "rewrite this draft" }
+  ): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload,
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    return reservation.reservationId;
+  }
+
+  it("returns the expected final concrete execute body for a valid reservation and identity file", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id);
+
+    fs.writeFileSync(
+      TEST_CHECKPOINT_IDENTITY_FILE,
+      JSON.stringify({
+        publicKey: "agent-pub-key",
+        identityId: "agentgate-identity-123",
+      })
+    );
+
+    expect(
+      prepareFinalCheckpointAgentGateExecuteBody(
+        reservationId,
+        TEST_CHECKPOINT_IDENTITY_FILE
+      )
+    ).toEqual({
+      identityId: "agentgate-identity-123",
+      bondId: "agent-bond-456",
+      actionType: "email-rewrite",
+      payload: { input: "rewrite this draft" },
+      exposure_cents: 50,
+    });
+  });
+
+  it("preserves actionType, payload, bondId, exposure_cents, and identityId", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id, {
+      file: "draft.txt",
+      transform: "rewrite",
+    });
+
+    fs.writeFileSync(
+      TEST_CHECKPOINT_IDENTITY_FILE,
+      JSON.stringify({
+        publicKey: "agent-pub-key",
+        identityId: "agentgate-identity-789",
+      })
+    );
+
+    const body = prepareFinalCheckpointAgentGateExecuteBody(
+      reservationId,
+      TEST_CHECKPOINT_IDENTITY_FILE
+    );
+
+    expect(body.identityId).toBe("agentgate-identity-789");
+    expect(body.bondId).toBe("agent-bond-456");
+    expect(body.actionType).toBe("email-rewrite");
+    expect(body.payload).toEqual({
+      file: "draft.txt",
+      transform: "rewrite",
+    });
+    expect(body.exposure_cents).toBe(50);
+  });
+
+  it("fails clearly for an ineligible reservation", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "draft" },
+      declaredExposureCents: 50,
+    }).reservationId;
+
+    fs.writeFileSync(
+      TEST_CHECKPOINT_IDENTITY_FILE,
+      JSON.stringify({
+        publicKey: "agent-pub-key",
+        identityId: "agentgate-identity-123",
+      })
+    );
+
+    expect(() =>
+      prepareFinalCheckpointAgentGateExecuteBody(
+        reservationId,
+        TEST_CHECKPOINT_IDENTITY_FILE
+      )
+    ).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointExecutePreparationError",
+        code: "NOT_IN_FORWARD",
+      })
+    );
+  });
+
+  it("fails clearly when the local identity cannot be resolved", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id);
+
+    expect(() =>
+      prepareFinalCheckpointAgentGateExecuteBody(
+        reservationId,
+        TEST_CHECKPOINT_IDENTITY_FILE
+      )
+    ).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointExecuteIdentityResolutionError",
+        code: "IDENTITY_FILE_NOT_FOUND",
       })
     );
   });

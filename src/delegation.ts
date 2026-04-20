@@ -1015,6 +1015,20 @@ export function finalizeCheckpointAgentGateExecuteRequest(
   }
 }
 
+export function prepareFinalCheckpointAgentGateExecuteBody(
+  reservationId: string,
+  identityFile?: string
+): CheckpointAgentGateExecuteRequestBody {
+  const preparedInput = prepareCheckpointExecuteInput(reservationId);
+  const builtRequest = buildCheckpointAgentGateExecuteRequest(preparedInput);
+  const identityId = resolveCheckpointAgentGateIdentityId(
+    builtRequest.identityRef,
+    identityFile
+  );
+
+  return finalizeCheckpointAgentGateExecuteRequest(builtRequest, identityId);
+}
+
 export function startCheckpointForwardAttempt(
   reservationId: string
 ): DelegationActionRow {
