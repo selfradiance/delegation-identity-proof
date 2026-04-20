@@ -6,9 +6,12 @@ import {
   formatSchemaIssue,
 } from "./checkpoint-schema";
 import {
+  CheckpointForwardTransitionError,
   CheckpointReservationError,
+  executeCheckpointForwardHandoff,
   getDelegation,
   reserveCheckpointAction,
+  startCheckpointForwardAttempt,
 } from "./delegation";
 import {
   verifyCheckpointRequestSignature,
@@ -30,21 +33,30 @@ export type CheckpointErrorCode =
   | "MAX_ACTIONS_EXCEEDED"
   | "PER_ACTION_EXPOSURE_EXCEEDED"
   | "MAX_TOTAL_EXPOSURE_EXCEEDED"
-  | "RESERVATION_FAILED";
+  | "RESERVATION_FAILED"
+  | "NOT_IN_FORWARD"
+  | "ALREADY_FORWARDED"
+  | "ALREADY_FINALIZED"
+  | "PRE_ATTACHMENT_FAILED"
+  | "FORWARD_TRANSITION_FAILED"
+  | "AGENTGATE_EXECUTE_FAILED";
 
 interface CheckpointErrorResponse {
   ok: false;
   code: CheckpointErrorCode;
   message: string;
+  stage?: "not_ready" | "pre_attachment_failed";
+  reservationId?: string;
 }
 
 interface CheckpointSuccessResponse {
   ok: true;
-  stage: "reserved";
-  forwardState: "pending_forward";
+  stage: "forwarded";
+  forwardState: "forwarded";
   delegationId: string;
   actionType: string;
   reservationId: string;
+  agentgateActionId: string;
 }
 
 type CheckpointResponse = CheckpointErrorResponse | CheckpointSuccessResponse;
@@ -113,6 +125,16 @@ function isTimestampWithinFreshnessWindow(timestamp: string, nowMs: number): boo
   const parsed = Date.parse(timestamp);
   return Math.abs(nowMs - parsed) <= TIMESTAMP_FRESHNESS_WINDOW_MS;
 }
+
+const CHECKPOINT_NOT_READY_MESSAGES = {
+  NOT_FOUND: "Checkpoint reservation not found",
+  NOT_IN_FORWARD: "Checkpoint reservation is not currently in_forward",
+  ALREADY_FORWARDED:
+    "Checkpoint reservation already has an attached AgentGate action id",
+  ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
+  PRE_ATTACHMENT_FAILED:
+    "Checkpoint reservation already failed before attachment",
+} as const;
 
 export async function handleCheckpointRequest(
   req: IncomingMessage,
@@ -257,13 +279,56 @@ export async function handleCheckpointRequest(
       declaredExposureCents: requestResult.data.declaredExposureCents,
     });
 
+    try {
+      startCheckpointForwardAttempt(reservation.reservationId);
+    } catch (error) {
+      if (error instanceof CheckpointForwardTransitionError) {
+        sendJson(res, 500, {
+          ok: false,
+          code: "FORWARD_TRANSITION_FAILED",
+          message: error.message,
+          reservationId: reservation.reservationId,
+        });
+        return;
+      }
+
+      throw error;
+    }
+
+    const handoff = await executeCheckpointForwardHandoff(
+      reservation.reservationId
+    );
+
+    if (!handoff.ok) {
+      if (handoff.stage === "not_ready") {
+        sendJson(res, handoff.code === "NOT_FOUND" ? 404 : 409, {
+          ok: false,
+          stage: "not_ready",
+          code: handoff.code,
+          reservationId: handoff.reservationId,
+          message: CHECKPOINT_NOT_READY_MESSAGES[handoff.code],
+        });
+        return;
+      }
+
+      sendJson(res, 502, {
+        ok: false,
+        stage: "pre_attachment_failed",
+        code: handoff.code,
+        reservationId: handoff.reservationId,
+        message: handoff.message,
+      });
+      return;
+    }
+
     sendJson(res, 200, {
       ok: true,
-      stage: "reserved",
-      forwardState: reservation.forwardState,
+      stage: "forwarded",
+      forwardState: "forwarded",
       delegationId: reservation.delegation.id,
       actionType: requestResult.data.actionType,
-      reservationId: reservation.reservationId,
+      reservationId: handoff.reservationId,
+      agentgateActionId: handoff.agentgateActionId,
     });
   } catch (error) {
     if (error instanceof CheckpointReservationError) {
