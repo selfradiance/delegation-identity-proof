@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
+import * as agentGateClient from "../src/agentgate-client";
 import { closeDb, getDb } from "../src/db";
 import {
   attachCheckpointForwardedAction,
@@ -26,6 +27,7 @@ import {
   failCheckpointForwardAttempt,
   finalizeCheckpointAgentGateExecuteRequest,
   finalizeCheckpointForwardedAction,
+  executeCheckpointForwardHandoff,
   getCheckpointExecuteReadiness,
   getCheckpointReservationExecutionStatus,
   isCheckpointReservationExecuteEligible,
@@ -75,6 +77,7 @@ beforeEach(() => {
 afterEach(() => {
   closeDb();
   delete process.env.DELEGATION_DB_PATH;
+  vi.restoreAllMocks();
   if (fs.existsSync(TEST_CHECKPOINT_IDENTITY_FILE)) {
     fs.unlinkSync(TEST_CHECKPOINT_IDENTITY_FILE);
   }
@@ -1677,6 +1680,159 @@ describe("checkpoint execute readiness", () => {
         code: "IDENTITY_FILE_NOT_FOUND",
       })
     );
+  });
+});
+
+describe("checkpoint execute handoff", () => {
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  function createExecuteEligibleReservation(
+    delegationId: string,
+    payload: unknown = { input: "rewrite this draft" }
+  ): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload,
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    return reservation.reservationId;
+  }
+
+  function writeCheckpointIdentityFile(identityId = "agentgate-identity-123"): void {
+    fs.writeFileSync(
+      TEST_CHECKPOINT_IDENTITY_FILE,
+      JSON.stringify({
+        publicKey: "agent-pub-key",
+        privateKey: Buffer.alloc(32, 1).toString("base64"),
+        identityId,
+      })
+    );
+  }
+
+  it("successfully calls AgentGate and attaches the returned action id", async () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id, {
+      file: "draft.txt",
+      transform: "rewrite",
+    });
+    writeCheckpointIdentityFile();
+
+    const executeSpy = vi
+      .spyOn(agentGateClient, "executeBondedAction")
+      .mockResolvedValue({ actionId: "ag-checkpoint-001" });
+
+    await expect(
+      executeCheckpointForwardHandoff(
+        reservationId,
+        TEST_CHECKPOINT_IDENTITY_FILE
+      )
+    ).resolves.toEqual({
+      ok: true,
+      stage: "forwarded",
+      reservationId,
+      agentgateActionId: "ag-checkpoint-001",
+    });
+
+    expect(executeSpy).toHaveBeenCalledWith(
+      {
+        publicKey: "agent-pub-key",
+        privateKey: Buffer.alloc(32, 1).toString("base64"),
+      },
+      "agentgate-identity-123",
+      "agent-bond-456",
+      "email-rewrite",
+      {
+        file: "draft.txt",
+        transform: "rewrite",
+      },
+      50
+    );
+
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "forwarded",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_FORWARDED,
+      outcome: null,
+      agentgateActionId: "ag-checkpoint-001",
+      resolvedAt: null,
+    });
+  });
+
+  it("lands in the pre-attachment failure seam when AgentGate execute fails", async () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id);
+    writeCheckpointIdentityFile();
+
+    const executeSpy = vi
+      .spyOn(agentGateClient, "executeBondedAction")
+      .mockRejectedValue(new Error("AgentGate /v1/actions/execute failed"));
+
+    await expect(
+      executeCheckpointForwardHandoff(
+        reservationId,
+        TEST_CHECKPOINT_IDENTITY_FILE
+      )
+    ).resolves.toEqual({
+      ok: false,
+      stage: "pre_attachment_failed",
+      reservationId,
+      code: "AGENTGATE_EXECUTE_FAILED",
+      message: "AgentGate /v1/actions/execute failed",
+    });
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "pre_attachment_failed",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      outcome: "failed",
+      agentgateActionId: null,
+      resolvedAt: expect.any(String),
+    });
+  });
+
+  it("rejects a non-eligible reservation before making a network call", async () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "draft" },
+      declaredExposureCents: 50,
+    }).reservationId;
+
+    const executeSpy = vi
+      .spyOn(agentGateClient, "executeBondedAction")
+      .mockResolvedValue({ actionId: "ag-checkpoint-001" });
+
+    await expect(executeCheckpointForwardHandoff(reservationId)).resolves.toEqual(
+      {
+        ok: false,
+        stage: "not_ready",
+        reservationId,
+        code: "NOT_IN_FORWARD",
+      }
+    );
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "pending_forward",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_PENDING,
+      outcome: null,
+      agentgateActionId: null,
+      resolvedAt: null,
+    });
   });
 });
 

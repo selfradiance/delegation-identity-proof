@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { getSavedIdentityMetadata } from "./agentgate-client";
+import * as agentGateClient from "./agentgate-client";
 import { getDb } from "./db";
 import {
   DelegationScopeSchema,
@@ -296,6 +296,27 @@ export interface CheckpointExecuteReadiness {
   code: CheckpointExecuteReadinessCode;
   executeBody?: CheckpointAgentGateExecuteRequestBody;
 }
+
+export type CheckpointExecuteHandoffResult =
+  | {
+      ok: true;
+      stage: "forwarded";
+      reservationId: string;
+      agentgateActionId: string;
+    }
+  | {
+      ok: false;
+      stage: "not_ready";
+      reservationId: string;
+      code: Exclude<CheckpointExecuteReadinessCode, "READY">;
+    }
+  | {
+      ok: false;
+      stage: "pre_attachment_failed";
+      reservationId: string;
+      code: "AGENTGATE_EXECUTE_FAILED";
+      message: string;
+    };
 
 export interface CheckpointPreparedExecuteInput {
   reservationId: string;
@@ -929,7 +950,7 @@ export function resolveCheckpointAgentGateIdentityId(
   }
 
   try {
-    const savedIdentity = getSavedIdentityMetadata(identityFile);
+    const savedIdentity = agentGateClient.getSavedIdentityMetadata(identityFile);
 
     if (!savedIdentity) {
       throw new CheckpointExecuteIdentityResolutionError(
@@ -1063,6 +1084,58 @@ export function getCheckpointExecuteReadiness(
       identityFile
     ),
   };
+}
+
+export async function executeCheckpointForwardHandoff(
+  reservationId: string,
+  identityFile?: string
+): Promise<CheckpointExecuteHandoffResult> {
+  const readiness = getCheckpointExecuteReadiness(reservationId, identityFile);
+
+  if (!readiness.ready || !readiness.executeBody) {
+    return {
+      ok: false,
+      stage: "not_ready",
+      reservationId: readiness.reservationId,
+      code: readiness.code as Exclude<
+        CheckpointExecuteReadinessCode,
+        "READY"
+      >,
+    };
+  }
+
+  const keys = agentGateClient.loadOrCreateKeypair(identityFile);
+
+  try {
+    const result = await agentGateClient.executeBondedAction(
+      keys,
+      readiness.executeBody.identityId,
+      readiness.executeBody.bondId,
+      readiness.executeBody.actionType,
+      readiness.executeBody.payload,
+      readiness.executeBody.exposure_cents
+    );
+
+    const agentgateActionId = result.actionId as string;
+    attachCheckpointForwardedAction(reservationId, agentgateActionId);
+
+    return {
+      ok: true,
+      stage: "forwarded",
+      reservationId,
+      agentgateActionId,
+    };
+  } catch (error) {
+    failCheckpointForwardAttempt(reservationId);
+
+    return {
+      ok: false,
+      stage: "pre_attachment_failed",
+      reservationId,
+      code: "AGENTGATE_EXECUTE_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export function startCheckpointForwardAttempt(

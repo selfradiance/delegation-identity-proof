@@ -32,7 +32,7 @@ AgentGate must be running for this project to work.
 - Bond TTL alignment (human bond = delegation TTL + 1hr margin)
 - Auto-complete on scope exhaustion
 - Crash recovery for orphaned action reservations
-- v0.2 Baby Step 17: one narrow read-only seam helper now re-checks execute eligibility and returns a small ready/not-ready result, including the final `/v1/actions/execute` body only when the reservation is ready, without making any network call or mutating local state
+- v0.2 Baby Step 18: one narrow internal execute handoff now performs the real AgentGate `/v1/actions/execute` call for execute-ready checkpoint reservations, attaches the returned action id on success, and lands in the existing pre-attachment failure seam on execute failure before an action id exists
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ npx tsx src/cli.ts status --delegation-id <id>
 
 ## Tests
 
-170 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
+173 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
 
 ```bash
 npm test
@@ -82,7 +82,7 @@ npm test
 
 ## Status
 
-v0.1.0 shipped and credible. v0.2 Baby Step 17 adds a small read-only seam helper that reports whether a reservation is execute-ready right now and includes the final concrete AgentGate execute body only when ready. Still no AgentGate execution or orchestration layer. 170 tests.
+v0.1.0 shipped and credible. v0.2 Baby Step 18 adds the first real checkpoint-managed AgentGate execute handoff, with local attach on success and pre-attachment failure landing on execute failure. Still no retry layer, background orchestration, or final resolution flow. 173 tests.
 
 Planned next work: [v0.2 server-mediated scope enforcement](docs/v0.2-server-mediated-scope-enforcement.md).
 
