@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { closeDb, getDb } from "../src/db";
 import {
   attachCheckpointForwardedAction,
+  CheckpointForwardFinalizationError,
   CHECKPOINT_FORWARD_STATE_FORWARDED,
   CHECKPOINT_FORWARD_STATE_IN_FORWARD,
   CHECKPOINT_FORWARD_STATE_PENDING,
@@ -16,6 +17,7 @@ import {
   reserveAction,
   finalizeAction,
   revertAction,
+  finalizeCheckpointForwardedAction,
   resolveAction,
   revokeDelegation,
   closeDelegation,
@@ -597,6 +599,182 @@ describe("checkpoint forward attachment", () => {
         name: "CheckpointForwardAttachmentError",
         code: "RESERVATION_NOT_FOUND",
       })
+    );
+  });
+});
+
+describe("checkpoint forward finalization", () => {
+  function acceptDelegation(id: string): void {
+    claimForAccept(id, "agent-pub-key");
+    finalizeAccept(id, "agent-bond-456");
+  }
+
+  function createForwardedReservation(delegationId: string): string {
+    const reservation = reserveCheckpointAction({
+      delegationId,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    attachCheckpointForwardedAction(
+      reservation.reservationId,
+      "ag-checkpoint-001"
+    );
+
+    return reservation.reservationId;
+  }
+
+  function expectFinalizationError(run: () => unknown, code: string): void {
+    expect(run).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointForwardFinalizationError",
+        code,
+      })
+    );
+  }
+
+  it("finalizes a forwarded reservation as success", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+
+    const finalized = finalizeCheckpointForwardedAction(
+      reservationId,
+      "success"
+    );
+
+    expect(finalized.id).toBe(reservationId);
+    expect(finalized.forward_state).toBe(CHECKPOINT_FORWARD_STATE_FORWARDED);
+    expect(finalized.agentgate_action_id).toBe("ag-checkpoint-001");
+    expect(finalized.outcome).toBe("success");
+    expect(finalized.resolved_at).not.toBeNull();
+  });
+
+  it("finalizes a forwarded reservation as failed", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+
+    const finalized = finalizeCheckpointForwardedAction(
+      reservationId,
+      "failed"
+    );
+
+    expect(finalized.outcome).toBe("failed");
+    expect(finalized.resolved_at).not.toBeNull();
+  });
+
+  it("writes checkpoint_forward_finalized once on successful finalization", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+
+    finalizeCheckpointForwardedAction(reservationId, "success");
+
+    const finalizedEvents = getEvents(d.id).filter(
+      (event) => event.event_type === "checkpoint_forward_finalized"
+    );
+
+    expect(finalizedEvents).toHaveLength(1);
+    expect(JSON.parse(finalizedEvents[0].detail_json ?? "{}")).toEqual({
+      reservation_id: reservationId,
+      agentgate_action_id: "ag-checkpoint-001",
+      final_outcome: "success",
+    });
+  });
+
+  it("rejects a second finalization attempt", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+
+    finalizeCheckpointForwardedAction(reservationId, "success");
+
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction(reservationId, "failed"),
+      "RESERVATION_ALREADY_FINALIZED"
+    );
+  });
+
+  it("rejects finalization from pending_forward", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction(reservation.reservationId, "success"),
+      "RESERVATION_NOT_FORWARDED"
+    );
+  });
+
+  it("rejects finalization from in_forward", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction(reservation.reservationId, "success"),
+      "RESERVATION_NOT_FORWARDED"
+    );
+  });
+
+  it("rejects finalization when forwarded has no attached AgentGate action id", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    getDb()
+      .prepare(
+        `UPDATE delegation_actions
+         SET forward_state = ?, agentgate_action_id = NULL
+         WHERE id = ?`
+      )
+      .run(CHECKPOINT_FORWARD_STATE_FORWARDED, reservation.reservationId);
+
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction(reservation.reservationId, "success"),
+      "AGENTGATE_ACTION_NOT_ATTACHED"
+    );
+  });
+
+  it("rejects finalization for a nonexistent reservation", () => {
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction("missing", "success"),
+      "RESERVATION_NOT_FOUND"
+    );
+  });
+
+  it("rejects an invalid checkpoint final outcome", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createForwardedReservation(d.id);
+
+    expectFinalizationError(
+      () => finalizeCheckpointForwardedAction(reservationId, "malicious"),
+      "INVALID_FINAL_OUTCOME"
     );
   });
 });

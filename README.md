@@ -32,7 +32,7 @@ AgentGate must be running for this project to work.
 - Bond TTL alignment (human bond = delegation TTL + 1hr margin)
 - Auto-complete on scope exhaustion
 - Crash recovery for orphaned action reservations
-- v0.2 Baby Step 7: `in_forward` checkpoint reservations can now attach one AgentGate action id and move into `forwarded` through a guarded local helper and event trail, creating the first honest local AgentGate handoff seam without finalize/revert logic
+- v0.2 Baby Step 8: `forwarded` checkpoint reservations can now finalize locally as `success` or `failed` through a guarded helper that writes `outcome` and `resolved_at`, creating the first narrow local finalization seam without retries or revert logic
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ npx tsx src/cli.ts status --delegation-id <id>
 
 ## Tests
 
-121 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
+130 tests across 8 files. 3 integration tests (opt-in via `RUN_INTEGRATION_TESTS=1`, requires live AgentGate).
 
 ```bash
 npm test
@@ -82,7 +82,7 @@ npm test
 
 ## Status
 
-v0.1.0 shipped and credible. v0.2 Baby Step 7 adds the first explicit local AgentGate handoff seam on checkpoint reservations by attaching one AgentGate action id after `in_forward`. Still no finalize/revert flow. 121 tests.
+v0.1.0 shipped and credible. v0.2 Baby Step 8 adds the first explicit local finalization seam on checkpoint reservations after `forwarded`. Still no revert or retry flow. 130 tests.
 
 Planned next work: [v0.2 server-mediated scope enforcement](docs/v0.2-server-mediated-scope-enforcement.md).
 

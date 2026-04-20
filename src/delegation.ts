@@ -32,6 +32,7 @@ export type DelegationOutcome =
   | "none";
 
 export type ActionOutcome = "success" | "failed" | "malicious";
+export type CheckpointForwardFinalOutcome = "success" | "failed";
 export const CHECKPOINT_FORWARD_STATE_PENDING = "pending_forward" as const;
 export const CHECKPOINT_FORWARD_STATE_IN_FORWARD = "in_forward" as const;
 export const CHECKPOINT_FORWARD_STATE_FORWARDED = "forwarded" as const;
@@ -311,6 +312,31 @@ export class CheckpointForwardAttachmentError extends Error {
   ) {
     super(message);
     this.name = "CheckpointForwardAttachmentError";
+    this.code = code;
+  }
+}
+
+export class CheckpointForwardFinalizationError extends Error {
+  code:
+    | "RESERVATION_NOT_FOUND"
+    | "RESERVATION_NOT_FORWARDED"
+    | "AGENTGATE_ACTION_NOT_ATTACHED"
+    | "RESERVATION_ALREADY_FINALIZED"
+    | "INVALID_FINAL_OUTCOME"
+    | "FORWARD_FINALIZATION_FAILED";
+
+  constructor(
+    code:
+      | "RESERVATION_NOT_FOUND"
+      | "RESERVATION_NOT_FORWARDED"
+      | "AGENTGATE_ACTION_NOT_ATTACHED"
+      | "RESERVATION_ALREADY_FINALIZED"
+      | "INVALID_FINAL_OUTCOME"
+      | "FORWARD_FINALIZATION_FAILED",
+    message: string
+  ) {
+    super(message);
+    this.name = "CheckpointForwardFinalizationError";
     this.code = code;
   }
 }
@@ -598,6 +624,97 @@ export function attachCheckpointForwardedAction(
     throw new CheckpointForwardAttachmentError(
       "FORWARD_ATTACHMENT_FAILED",
       "Failed to attach AgentGate action id to checkpoint reservation"
+    );
+  }
+}
+
+export function finalizeCheckpointForwardedAction(
+  reservationId: string,
+  outcome: string
+): DelegationActionRow {
+  const db = getDb();
+  const finalizeForwardedAction = db.transaction(
+    (txReservationId: string, txOutcome: string) => {
+      if (txOutcome !== "success" && txOutcome !== "failed") {
+        throw new CheckpointForwardFinalizationError(
+          "INVALID_FINAL_OUTCOME",
+          `Unsupported checkpoint final outcome "${txOutcome}"`
+        );
+      }
+
+      const action = db
+        .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+        .get(txReservationId) as DelegationActionRow | undefined;
+
+      if (!action) {
+        throw new CheckpointForwardFinalizationError(
+          "RESERVATION_NOT_FOUND",
+          "Checkpoint reservation not found"
+        );
+      }
+
+      if (action.outcome !== null || action.resolved_at !== null) {
+        throw new CheckpointForwardFinalizationError(
+          "RESERVATION_ALREADY_FINALIZED",
+          "Checkpoint reservation is already finalized"
+        );
+      }
+
+      if (action.forward_state !== CHECKPOINT_FORWARD_STATE_FORWARDED) {
+        throw new CheckpointForwardFinalizationError(
+          "RESERVATION_NOT_FORWARDED",
+          "Checkpoint reservation is not currently forwarded"
+        );
+      }
+
+      if (action.agentgate_action_id === null) {
+        throw new CheckpointForwardFinalizationError(
+          "AGENTGATE_ACTION_NOT_ATTACHED",
+          "Checkpoint reservation has no attached AgentGate action id"
+        );
+      }
+
+      const now = new Date().toISOString();
+      const result = db.prepare(
+        `UPDATE delegation_actions
+         SET outcome = ?, resolved_at = ?
+         WHERE id = ? AND forward_state = ? AND agentgate_action_id IS NOT NULL AND outcome IS NULL AND resolved_at IS NULL`
+      ).run(
+        txOutcome,
+        now,
+        txReservationId,
+        CHECKPOINT_FORWARD_STATE_FORWARDED
+      );
+
+      if (result.changes !== 1) {
+        throw new CheckpointForwardFinalizationError(
+          "FORWARD_FINALIZATION_FAILED",
+          "Failed to finalize forwarded checkpoint reservation"
+        );
+      }
+
+      logEvent(action.delegation_id, "checkpoint_forward_finalized", {
+        reservation_id: txReservationId,
+        agentgate_action_id: action.agentgate_action_id,
+        final_outcome: txOutcome,
+      });
+
+      return db
+        .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+        .get(txReservationId) as DelegationActionRow;
+    }
+  );
+
+  try {
+    return finalizeForwardedAction.immediate(reservationId, outcome);
+  } catch (error) {
+    if (error instanceof CheckpointForwardFinalizationError) {
+      throw error;
+    }
+
+    throw new CheckpointForwardFinalizationError(
+      "FORWARD_FINALIZATION_FAILED",
+      "Failed to finalize forwarded checkpoint reservation"
     );
   }
 }
