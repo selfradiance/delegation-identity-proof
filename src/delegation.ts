@@ -8,6 +8,7 @@ import {
   type DelegationScope,
   type ScopeCheckResult,
 } from "./scope";
+import { appendTransparencyLogRow } from "./transparency-log";
 
 // --- Types ---
 
@@ -149,6 +150,11 @@ export function createDelegation(params: CreateDelegationParams): DelegationRow 
     delegator_bond_id: params.delegatorBondId,
     ttl_seconds: params.ttlSeconds,
   });
+  appendTransparencyLogRow({
+    delegationId: id,
+    eventType: "delegation_created",
+    actorKind: "delegator",
+  });
 
   return getDelegation(id)!;
 }
@@ -205,6 +211,11 @@ export function finalizeAccept(
 
   logEvent(delegationId, "delegation_accepted", {
     delegate_bond_id: delegateBondId,
+  });
+  appendTransparencyLogRow({
+    delegationId,
+    eventType: "delegation_accepted",
+    actorKind: "delegate",
   });
 
   return getDelegation(delegationId);
@@ -1797,6 +1808,11 @@ export function revokeDelegation(delegationId: string): DelegationRow | null {
     if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_revoked", { settling: true });
+    appendTransparencyLogRow({
+      delegationId,
+      eventType: "delegation_revoked",
+      actorKind: "delegator",
+    });
   } else {
     // No open actions — go straight to completed
     const outcome = computeOutcome(delegationId);
@@ -1810,6 +1826,11 @@ export function revokeDelegation(delegationId: string): DelegationRow | null {
     if (result.changes !== 1) return null;
 
     logEvent(delegationId, "delegation_revoked", { settling: false });
+    appendTransparencyLogRow({
+      delegationId,
+      eventType: "delegation_revoked",
+      actorKind: "delegator",
+    });
     logEvent(delegationId, "delegation_completed", {
       outcome,
       reason: "revoked",
@@ -1851,6 +1872,11 @@ export function closeDelegation(delegationId: string): DelegationRow | null {
 
   if (result.changes !== 1) return null;
 
+  appendTransparencyLogRow({
+    delegationId,
+    eventType: "delegation_closed",
+    actorKind: "delegator",
+  });
   logEvent(delegationId, "delegation_completed", {
     outcome,
     reason: "closed",

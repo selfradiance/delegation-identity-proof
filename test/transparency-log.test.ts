@@ -1,6 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { closeDb, getDb } from "../src/db";
+import {
+  claimForAccept,
+  closeDelegation,
+  createDelegation,
+  finalizeAccept,
+  finalizeAction,
+  reserveAction,
+  resolveAction,
+  revokeDelegation,
+} from "../src/delegation";
 import { appendTransparencyLogRow } from "../src/transparency-log";
+
+const TEST_SCOPE = {
+  allowed_actions: ["email-rewrite"],
+  max_actions: 3,
+  max_exposure_cents: 83,
+  max_total_exposure_cents: 300,
+  description: "Test delegation scope",
+};
 
 function insertDelegation(delegationId: string): void {
   const db = getDb();
@@ -20,6 +38,16 @@ function insertDelegation(delegationId: string): void {
     now,
     expiresAt
   );
+}
+
+function makeTestDelegation() {
+  return createDelegation({
+    delegatorId: "delegator-pub-key",
+    delegateId: "delegate-pub-key",
+    scope: TEST_SCOPE,
+    delegatorBondId: "bond-123",
+    ttlSeconds: 3600,
+  });
 }
 
 beforeEach(() => {
@@ -114,5 +142,168 @@ describe("transparency log", () => {
 
     expect(firstStoredAfter).toEqual(firstStoredBefore);
     expect(rowCount.count).toBe(2);
+  });
+});
+
+describe("transparency log lifecycle wiring", () => {
+  it("successful delegation creation appends one delegation_created row", () => {
+    const delegation = makeTestDelegation();
+    const db = getDb();
+
+    const rows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(delegation.id) as Array<Record<string, unknown>>;
+
+    expect(rows).toEqual([
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+    ]);
+  });
+
+  it("successful accept appends one delegation_accepted row", () => {
+    const delegation = makeTestDelegation();
+    claimForAccept(delegation.id, "delegate-pub-key");
+    finalizeAccept(delegation.id, "agent-bond-456");
+    const db = getDb();
+
+    const rows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(delegation.id) as Array<Record<string, unknown>>;
+
+    expect(rows).toEqual([
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_accepted",
+        actor_kind: "delegate",
+      },
+    ]);
+  });
+
+  it("successful revoke appends one delegation_revoked row", () => {
+    const delegation = makeTestDelegation();
+    revokeDelegation(delegation.id);
+    const db = getDb();
+
+    const rows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(delegation.id) as Array<Record<string, unknown>>;
+
+    expect(rows).toEqual([
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_revoked",
+        actor_kind: "delegator",
+      },
+    ]);
+  });
+
+  it("successful close appends one delegation_closed row", () => {
+    const delegation = makeTestDelegation();
+    claimForAccept(delegation.id, "delegate-pub-key");
+    finalizeAccept(delegation.id, "agent-bond-456");
+
+    const reservation = reserveAction({
+      delegationId: delegation.id,
+      actorPublicKey: "delegate-pub-key",
+      actionType: "email-rewrite",
+      declaredExposureCents: 50,
+    });
+    if (!("actionId" in reservation)) {
+      throw new Error("Expected reservation");
+    }
+
+    finalizeAction(reservation.actionId, delegation.id, "ag-action-001");
+    resolveAction(reservation.actionId, "success");
+    closeDelegation(delegation.id);
+    const db = getDb();
+
+    const rows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(delegation.id) as Array<Record<string, unknown>>;
+
+    expect(rows).toEqual([
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_accepted",
+        actor_kind: "delegate",
+      },
+      {
+        delegation_id: delegation.id,
+        event_type: "delegation_closed",
+        actor_kind: "delegator",
+      },
+    ]);
+  });
+
+  it("failed operations do not append misleading transparency rows", () => {
+    const pendingDelegation = makeTestDelegation();
+
+    expect(finalizeAccept(pendingDelegation.id, "agent-bond-456")).toBeNull();
+    expect(closeDelegation(pendingDelegation.id)).toBeNull();
+
+    const db = getDb();
+    const pendingRows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(pendingDelegation.id) as Array<Record<string, unknown>>;
+
+    expect(pendingRows).toEqual([
+      {
+        delegation_id: pendingDelegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+    ]);
+
+    const revokedDelegation = makeTestDelegation();
+
+    expect(revokeDelegation(revokedDelegation.id)).not.toBeNull();
+    expect(revokeDelegation(revokedDelegation.id)).toBeNull();
+
+    const revokedRows = db
+      .prepare(
+        "SELECT delegation_id, event_type, actor_kind FROM delegation_transparency_log WHERE delegation_id = ? ORDER BY created_at"
+      )
+      .all(revokedDelegation.id) as Array<Record<string, unknown>>;
+
+    expect(revokedRows).toEqual([
+      {
+        delegation_id: revokedDelegation.id,
+        event_type: "delegation_created",
+        actor_kind: "delegator",
+      },
+      {
+        delegation_id: revokedDelegation.id,
+        event_type: "delegation_revoked",
+        actor_kind: "delegator",
+      },
+    ]);
   });
 });
