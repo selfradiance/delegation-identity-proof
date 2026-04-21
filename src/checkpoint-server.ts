@@ -30,6 +30,7 @@ export type CheckpointErrorCode =
   | "INVALID_REQUEST"
   | "DELEGATION_NOT_FOUND"
   | "DELEGATION_NOT_ACTIVE"
+  | "DELEGATION_NOT_ELIGIBLE"
   | "DELEGATE_MISMATCH"
   | "TIMESTAMP_OUT_OF_WINDOW"
   | "INVALID_SIGNATURE"
@@ -157,6 +158,8 @@ function isTimestampWithinFreshnessWindow(timestamp: string, nowMs: number): boo
 const CHECKPOINT_NOT_READY_MESSAGES = {
   NOT_FOUND: "Checkpoint reservation not found",
   NOT_IN_FORWARD: "Checkpoint reservation is not currently in_forward",
+  DELEGATION_NOT_ELIGIBLE:
+    "Parent delegation is no longer eligible for checkpoint execution",
   ALREADY_FORWARDED:
     "Checkpoint reservation already has an attached AgentGate action id",
   ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
@@ -449,6 +452,16 @@ export async function handleCheckpointRequest(
       startCheckpointForwardAttempt(reservation.reservationId);
     } catch (error) {
       if (error instanceof CheckpointForwardTransitionError) {
+        if (error.code === "DELEGATION_NOT_ELIGIBLE") {
+          sendJson(res, 409, {
+            ok: false,
+            code: "DELEGATION_NOT_ELIGIBLE",
+            message: error.message,
+            reservationId: reservation.reservationId,
+          });
+          return;
+        }
+
         sendJson(res, 500, {
           ok: false,
           code: "FORWARD_TRANSITION_FAILED",

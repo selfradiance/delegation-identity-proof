@@ -40,6 +40,8 @@ export const CHECKPOINT_FORWARD_STATE_IN_FORWARD = "in_forward" as const;
 export const CHECKPOINT_FORWARD_STATE_FORWARDED = "forwarded" as const;
 export const CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT =
   "pre_attachment_forward_failed" as const;
+export const CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE =
+  "delegation_not_eligible" as const;
 export type CheckpointForwardState =
   | typeof CHECKPOINT_FORWARD_STATE_PENDING
   | typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD
@@ -288,6 +290,7 @@ export type CheckpointReservationExecuteEligibilityCode =
   | "ELIGIBLE"
   | "NOT_FOUND"
   | "NOT_IN_FORWARD"
+  | "DELEGATION_NOT_ELIGIBLE"
   | "ALREADY_FORWARDED"
   | "ALREADY_FINALIZED"
   | "PRE_ATTACHMENT_FAILED";
@@ -425,12 +428,14 @@ export class CheckpointForwardTransitionError extends Error {
   code:
     | "RESERVATION_NOT_FOUND"
     | "RESERVATION_NOT_FORWARDABLE"
+    | "DELEGATION_NOT_ELIGIBLE"
     | "FORWARD_TRANSITION_FAILED";
 
   constructor(
     code:
       | "RESERVATION_NOT_FOUND"
       | "RESERVATION_NOT_FORWARDABLE"
+      | "DELEGATION_NOT_ELIGIBLE"
       | "FORWARD_TRANSITION_FAILED",
     message: string
   ) {
@@ -438,6 +443,168 @@ export class CheckpointForwardTransitionError extends Error {
     this.name = "CheckpointForwardTransitionError";
     this.code = code;
   }
+}
+
+function syncCheckpointReservationParentExpiry(reservationId: string): void {
+  const db = getDb();
+  const action = db
+    .prepare("SELECT delegation_id FROM delegation_actions WHERE id = ?")
+    .get(reservationId) as { delegation_id: string } | undefined;
+
+  if (action) {
+    checkExpiry(action.delegation_id);
+  }
+}
+
+function getCheckpointDelegationIneligibility(
+  delegation: DelegationRow | null,
+  nowMs = Date.now()
+): { message: string; detail: Record<string, unknown> } | null {
+  if (!delegation) {
+    return {
+      message:
+        "Parent delegation for checkpoint reservation is no longer available",
+      detail: {
+        delegation_status: null,
+        terminal_reason: null,
+      },
+    };
+  }
+
+  if (delegation.terminal_reason === "revoked") {
+    return {
+      message: "Parent delegation was revoked before checkpoint work could continue",
+      detail: {
+        delegation_status: delegation.status,
+        terminal_reason: delegation.terminal_reason,
+      },
+    };
+  }
+
+  if (
+    delegation.terminal_reason === "expired" ||
+    Date.parse(delegation.expires_at) <= nowMs
+  ) {
+    return {
+      message: "Parent delegation expired before checkpoint work could continue",
+      detail: {
+        delegation_status: delegation.status,
+        terminal_reason: delegation.terminal_reason,
+      },
+    };
+  }
+
+  if (delegation.status === "settling") {
+    return {
+      message: "Parent delegation is settling and cannot continue checkpoint work",
+      detail: {
+        delegation_status: delegation.status,
+        terminal_reason: delegation.terminal_reason,
+      },
+    };
+  }
+
+  if (delegation.status !== "accepted" && delegation.status !== "active") {
+    return {
+      message: `Parent delegation status "${delegation.status}" cannot continue checkpoint work`,
+      detail: {
+        delegation_status: delegation.status,
+        terminal_reason: delegation.terminal_reason,
+      },
+    };
+  }
+
+  return null;
+}
+
+function recordCheckpointPreAttachmentFailure(
+  db: ReturnType<typeof getDb>,
+  action: DelegationActionRow,
+  expectedForwardState: CheckpointForwardState,
+  reasonCode: string,
+  detail?: Record<string, unknown>
+): DelegationActionRow {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    `UPDATE delegation_actions
+     SET outcome = ?, resolved_at = ?
+     WHERE id = ? AND forward_state = ? AND agentgate_action_id IS NULL AND outcome IS NULL AND resolved_at IS NULL`
+  ).run("failed", now, action.id, expectedForwardState);
+
+  if (result.changes !== 1) {
+    throw new Error("Failed to record checkpoint pre-attachment failure");
+  }
+
+  logEvent(action.delegation_id, "checkpoint_forward_failed", {
+    reservation_id: action.id,
+    failure_reason: reasonCode,
+    ...detail,
+  });
+  appendTransparencyLogRow({
+    delegationId: action.delegation_id,
+    reservationId: action.id,
+    eventType: "checkpoint_forward_failed",
+    actorKind: "checkpoint",
+    agentgateActionId: null,
+    outcome: "failed",
+    reasonCode,
+  });
+
+  return db
+    .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+    .get(action.id) as DelegationActionRow;
+}
+
+function failCheckpointReservationForIneligibleDelegation(
+  reservationId: string,
+  expectedForwardState: typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD
+): { failed: true; delegationId: string; message: string } | { failed: false } {
+  const db = getDb();
+  const failReservation = db.transaction((txReservationId: string) => {
+    const action = db
+      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+      .get(txReservationId) as DelegationActionRow | undefined;
+
+    if (
+      !action ||
+      action.forward_state !== expectedForwardState ||
+      action.agentgate_action_id !== null ||
+      action.outcome !== null ||
+      action.resolved_at !== null
+    ) {
+      return { failed: false } as const;
+    }
+
+    const delegation = db
+      .prepare("SELECT * FROM delegations WHERE id = ?")
+      .get(action.delegation_id) as DelegationRow | undefined;
+    const ineligibility = getCheckpointDelegationIneligibility(delegation ?? null);
+
+    if (!ineligibility) {
+      return { failed: false } as const;
+    }
+
+    recordCheckpointPreAttachmentFailure(
+      db,
+      action,
+      expectedForwardState,
+      CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE,
+      ineligibility.detail
+    );
+
+    return {
+      failed: true,
+      delegationId: action.delegation_id,
+      message: ineligibility.message,
+    } as const;
+  });
+
+  const result = failReservation.immediate(reservationId);
+  if (result.failed) {
+    tryAutoComplete(result.delegationId);
+  }
+
+  return result;
 }
 
 export class CheckpointForwardAttachmentError extends Error {
@@ -786,8 +953,9 @@ export function getCheckpointReservationExecutionStatus(
     status = "finalized_success";
   } else if (
     action.outcome === "failed" &&
-    action.forward_state === CHECKPOINT_FORWARD_STATE_IN_FORWARD &&
-    action.agentgate_action_id === null
+    action.agentgate_action_id === null &&
+    (action.forward_state === CHECKPOINT_FORWARD_STATE_PENDING ||
+      action.forward_state === CHECKPOINT_FORWARD_STATE_IN_FORWARD)
   ) {
     status = "pre_attachment_failed";
   } else if (action.outcome === "failed") {
@@ -820,6 +988,20 @@ export function isCheckpointReservationExecuteEligible(
     status.agentgateActionId === null &&
     status.outcome === null
   ) {
+    syncCheckpointReservationParentExpiry(reservationId);
+    const blocked = failCheckpointReservationForIneligibleDelegation(
+      reservationId,
+      CHECKPOINT_FORWARD_STATE_IN_FORWARD
+    );
+
+    if (blocked.failed) {
+      return {
+        reservationId,
+        eligible: false,
+        code: "DELEGATION_NOT_ELIGIBLE",
+      };
+    }
+
     return {
       reservationId: status.reservationId,
       eligible: true,
@@ -881,6 +1063,8 @@ export function prepareCheckpointExecuteInput(
     > = {
       NOT_FOUND: "Checkpoint reservation not found",
       NOT_IN_FORWARD: "Checkpoint reservation is not currently in_forward",
+      DELEGATION_NOT_ELIGIBLE:
+        "Parent delegation is no longer eligible for checkpoint execution",
       ALREADY_FORWARDED:
         "Checkpoint reservation already has an attached AgentGate action id",
       ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
@@ -1300,6 +1484,8 @@ export function startCheckpointForwardAttempt(
   reservationId: string
 ): DelegationActionRow {
   const db = getDb();
+  syncCheckpointReservationParentExpiry(reservationId);
+
   const startForward = db.transaction((txReservationId: string) => {
     const action = db
       .prepare("SELECT * FROM delegation_actions WHERE id = ?")
@@ -1322,6 +1508,29 @@ export function startCheckpointForwardAttempt(
         "RESERVATION_NOT_FORWARDABLE",
         "Checkpoint reservation is not eligible to start a forward attempt"
       );
+    }
+
+    const delegation = db
+      .prepare("SELECT * FROM delegations WHERE id = ?")
+      .get(action.delegation_id) as DelegationRow | undefined;
+    const ineligibility = getCheckpointDelegationIneligibility(
+      delegation ?? null
+    );
+
+    if (ineligibility) {
+      recordCheckpointPreAttachmentFailure(
+        db,
+        action,
+        CHECKPOINT_FORWARD_STATE_PENDING,
+        CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE,
+        ineligibility.detail
+      );
+
+      return {
+        blocked: true,
+        delegationId: action.delegation_id,
+        message: ineligibility.message,
+      } as const;
     }
 
     const result = db.prepare(
@@ -1353,13 +1562,26 @@ export function startCheckpointForwardAttempt(
       actorKind: "checkpoint",
     });
 
-    return db
-      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
-      .get(txReservationId) as DelegationActionRow;
+    return {
+      blocked: false,
+      action: db
+        .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+        .get(txReservationId) as DelegationActionRow,
+    } as const;
   });
 
   try {
-    return startForward.immediate(reservationId);
+    const result = startForward.immediate(reservationId);
+
+    if (result.blocked) {
+      tryAutoComplete(result.delegationId);
+      throw new CheckpointForwardTransitionError(
+        "DELEGATION_NOT_ELIGIBLE",
+        result.message
+      );
+    }
+
+    return result.action;
   } catch (error) {
     if (error instanceof CheckpointForwardTransitionError) {
       throw error;
@@ -1493,42 +1715,12 @@ export function failCheckpointForwardAttempt(
       );
     }
 
-    const now = new Date().toISOString();
-    const result = db.prepare(
-      `UPDATE delegation_actions
-       SET outcome = ?, resolved_at = ?
-       WHERE id = ? AND forward_state = ? AND agentgate_action_id IS NULL AND outcome IS NULL AND resolved_at IS NULL`
-    ).run(
-      "failed",
-      now,
-      txReservationId,
-      CHECKPOINT_FORWARD_STATE_IN_FORWARD
+    return recordCheckpointPreAttachmentFailure(
+      db,
+      action,
+      CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT
     );
-
-    if (result.changes !== 1) {
-      throw new CheckpointForwardFailureError(
-        "FORWARD_FAILURE_FAILED",
-        "Failed to record pre-attachment checkpoint forward failure"
-      );
-    }
-
-    logEvent(action.delegation_id, "checkpoint_forward_failed", {
-      reservation_id: txReservationId,
-      failure_reason: CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT,
-    });
-    appendTransparencyLogRow({
-      delegationId: action.delegation_id,
-      reservationId: txReservationId,
-      eventType: "checkpoint_forward_failed",
-      actorKind: "checkpoint",
-      agentgateActionId: null,
-      outcome: "failed",
-      reasonCode: CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT,
-    });
-
-    return db
-      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
-      .get(txReservationId) as DelegationActionRow;
   });
 
   try {
@@ -1631,7 +1823,9 @@ export function finalizeCheckpointForwardedAction(
   );
 
   try {
-    return finalizeForwardedAction.immediate(reservationId, outcome);
+    const action = finalizeForwardedAction.immediate(reservationId, outcome);
+    tryAutoComplete(action.delegation_id);
+    return action;
   } catch (error) {
     if (error instanceof CheckpointForwardFinalizationError) {
       throw error;
