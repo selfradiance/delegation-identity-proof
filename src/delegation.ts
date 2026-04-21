@@ -1511,6 +1511,15 @@ export function failCheckpointForwardAttempt(
       reservation_id: txReservationId,
       failure_reason: CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT,
     });
+    appendTransparencyLogRow({
+      delegationId: action.delegation_id,
+      reservationId: txReservationId,
+      eventType: "checkpoint_forward_failed",
+      actorKind: "checkpoint",
+      agentgateActionId: null,
+      outcome: "failed",
+      reasonCode: CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT,
+    });
 
     return db
       .prepare("SELECT * FROM delegation_actions WHERE id = ?")
@@ -1600,6 +1609,14 @@ export function finalizeCheckpointForwardedAction(
         reservation_id: txReservationId,
         agentgate_action_id: action.agentgate_action_id,
         final_outcome: txOutcome,
+      });
+      appendTransparencyLogRow({
+        delegationId: action.delegation_id,
+        reservationId: txReservationId,
+        eventType: "checkpoint_forward_finalized",
+        actorKind: "resolver",
+        agentgateActionId: action.agentgate_action_id,
+        outcome: txOutcome,
       });
 
       return db

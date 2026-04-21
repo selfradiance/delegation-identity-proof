@@ -207,14 +207,16 @@ function getCheckpointTransparencyRows(delegationId: string) {
   const db = getDb();
   return db
     .prepare(
-      `SELECT delegation_id, reservation_id, event_type, actor_kind, agentgate_action_id
+      `SELECT delegation_id, reservation_id, event_type, actor_kind, agentgate_action_id, outcome, reason_code
        FROM delegation_transparency_log
        WHERE delegation_id = ?
          AND event_type IN (
            'delegated_execute_requested',
            'checkpoint_action_reserved',
            'checkpoint_forward_started',
-           'checkpoint_forward_attached'
+           'checkpoint_forward_attached',
+           'checkpoint_forward_finalized',
+           'checkpoint_forward_failed'
          )
        ORDER BY rowid`
     )
@@ -427,6 +429,8 @@ describe("checkpoint server — execute endpoint", () => {
         event_type: "delegated_execute_requested",
         actor_kind: "delegate",
         agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
       },
       {
         delegation_id: delegation.id,
@@ -434,6 +438,8 @@ describe("checkpoint server — execute endpoint", () => {
         event_type: "checkpoint_action_reserved",
         actor_kind: "checkpoint",
         agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
       },
       {
         delegation_id: delegation.id,
@@ -441,6 +447,8 @@ describe("checkpoint server — execute endpoint", () => {
         event_type: "checkpoint_forward_started",
         actor_kind: "checkpoint",
         agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
       },
       {
         delegation_id: delegation.id,
@@ -448,6 +456,8 @@ describe("checkpoint server — execute endpoint", () => {
         event_type: "checkpoint_forward_attached",
         actor_kind: "checkpoint",
         agentgate_action_id: "ag-checkpoint-001",
+        outcome: null,
+        reason_code: null,
       },
     ]);
   });
@@ -478,6 +488,8 @@ describe("checkpoint server — execute endpoint", () => {
       event_type: "checkpoint_action_reserved",
       actor_kind: "checkpoint",
       agentgate_action_id: null,
+      outcome: null,
+      reason_code: null,
     });
   });
 
@@ -810,7 +822,8 @@ describe("checkpoint server — execute endpoint", () => {
     );
 
     expect(response.status).toBe(502);
-    await expect(response.json()).resolves.toEqual({
+    const body = await response.json();
+    expect(body).toEqual({
       ok: false,
       stage: "pre_attachment_failed",
       code: "AGENTGATE_EXECUTE_FAILED",
@@ -829,6 +842,44 @@ describe("checkpoint server — execute endpoint", () => {
         (event) => event.event_type === "checkpoint_forward_failed"
       )
     ).toHaveLength(1);
+    expect(getCheckpointTransparencyRows(delegation.id)).toEqual([
+      {
+        delegation_id: delegation.id,
+        reservation_id: null,
+        event_type: "delegated_execute_requested",
+        actor_kind: "delegate",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: body.reservationId,
+        event_type: "checkpoint_action_reserved",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: actions[0].id,
+        event_type: "checkpoint_forward_started",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: actions[0].id,
+        event_type: "checkpoint_forward_failed",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: "failed",
+        reason_code: "pre_attachment_forward_failed",
+      },
+    ]);
   });
 
   it("returns DELEGATION_NOT_FOUND when the delegation does not exist", async () => {
@@ -1341,6 +1392,95 @@ describe("checkpoint server — finalize endpoint", () => {
     expect(action.agentgate_action_id).toBe("ag-checkpoint-001");
     expect(action.outcome).toBe("success");
     expect(action.resolved_at).not.toBeNull();
+  });
+
+  it("appends the expected transparency event order through checkpoint_forward_finalized for a successful full path", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegation(delegateKeys);
+    const { baseUrl } = await startServer();
+    writeResolverIdentityFile();
+
+    vi.spyOn(agentGateClient, "resolveAgentGateAction").mockResolvedValue({
+      ok: true,
+    });
+
+    const executeResponse = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/execute`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(buildSignedRequest(delegation.id, delegateKeys)),
+      }
+    );
+
+    expect(executeResponse.status).toBe(200);
+    const executeBody = await executeResponse.json();
+
+    const finalizeResponse = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/actions/${executeBody.reservationId}/finalize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "success" }),
+      }
+    );
+
+    expect(finalizeResponse.status).toBe(200);
+    await expect(finalizeResponse.json()).resolves.toEqual({
+      ok: true,
+      stage: "finalized",
+      reservationId: executeBody.reservationId,
+      agentgateActionId: "ag-checkpoint-001",
+      outcome: "success",
+    });
+
+    expect(getCheckpointTransparencyRows(delegation.id)).toEqual([
+      {
+        delegation_id: delegation.id,
+        reservation_id: null,
+        event_type: "delegated_execute_requested",
+        actor_kind: "delegate",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: executeBody.reservationId,
+        event_type: "checkpoint_action_reserved",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: executeBody.reservationId,
+        event_type: "checkpoint_forward_started",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: executeBody.reservationId,
+        event_type: "checkpoint_forward_attached",
+        actor_kind: "checkpoint",
+        agentgate_action_id: "ag-checkpoint-001",
+        outcome: null,
+        reason_code: null,
+      },
+      {
+        delegation_id: delegation.id,
+        reservation_id: executeBody.reservationId,
+        event_type: "checkpoint_forward_finalized",
+        actor_kind: "resolver",
+        agentgate_action_id: "ag-checkpoint-001",
+        outcome: "success",
+        reason_code: null,
+      },
+    ]);
   });
 
   it("finalizes a forwarded checkpoint reservation as failed through the explicit endpoint", async () => {
