@@ -11,7 +11,7 @@ afterEach(() => {
 });
 
 describe("db — schema", () => {
-  it("creates all three tables", () => {
+  it("creates all four tables", () => {
     const db = getDb();
     const tables = db
       .prepare(
@@ -23,6 +23,7 @@ describe("db — schema", () => {
     expect(tableNames).toContain("delegations");
     expect(tableNames).toContain("delegation_actions");
     expect(tableNames).toContain("delegation_events");
+    expect(tableNames).toContain("delegation_transparency_log");
   });
 
   it("delegations table has expected columns", () => {
@@ -85,6 +86,26 @@ describe("db — schema", () => {
       "delegation_id",
       "event_type",
       "detail_json",
+      "created_at",
+    ]);
+  });
+
+  it("delegation_transparency_log table has expected columns", () => {
+    const db = getDb();
+    const cols = db
+      .prepare("PRAGMA table_info(delegation_transparency_log)")
+      .all() as { name: string }[];
+    const colNames = cols.map((c) => c.name);
+
+    expect(colNames).toEqual([
+      "id",
+      "delegation_id",
+      "reservation_id",
+      "event_type",
+      "actor_kind",
+      "agentgate_action_id",
+      "outcome",
+      "reason_code",
       "created_at",
     ]);
   });
