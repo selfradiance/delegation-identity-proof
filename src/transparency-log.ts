@@ -112,3 +112,17 @@ export function appendTransparencyLogRow(
 
   return row;
 }
+
+export function getTransparencyLogRows(
+  delegationId: string
+): TransparencyLogRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT id, delegation_id, reservation_id, event_type, actor_kind, agentgate_action_id, outcome, reason_code, created_at
+       FROM delegation_transparency_log
+       WHERE delegation_id = ?
+       ORDER BY created_at ASC, rowid ASC`
+    )
+    .all(delegationId) as TransparencyLogRow[];
+}

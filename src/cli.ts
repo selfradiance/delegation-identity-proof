@@ -34,6 +34,7 @@ import {
   type DelegationRow,
 } from "./delegation";
 import { DelegationScopeSchema, type DelegationScope } from "./scope";
+import { getTransparencyLogRows } from "./transparency-log";
 
 // ---------------------------------------------------------------------------
 // Arg parsing helpers
@@ -79,6 +80,10 @@ function getPositiveIntArg(
     process.exit(1);
   }
   return n;
+}
+
+function hasFlag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
 }
 
 function parsePayloadArg(payloadStr: string): Record<string, unknown> {
@@ -403,6 +408,7 @@ function cmdClose(): void {
 
 function cmdStatus(): void {
   const delegationId = getArg("delegation", true);
+  const showLog = hasFlag("log");
 
   // Check expiry first
   checkExpiry(delegationId);
@@ -416,6 +422,7 @@ function cmdStatus(): void {
   const scope: DelegationScope = JSON.parse(delegation.scope_json);
   const actions = getActions(delegationId);
   const events = getEvents(delegationId);
+  const transparencyLog = showLog ? getTransparencyLogRows(delegationId) : [];
 
   console.log("=== Delegation Status ===");
   console.log(`  ID:              ${delegation.id}`);
@@ -451,6 +458,37 @@ function cmdStatus(): void {
       ? ` — ${event.detail_json}`
       : "";
     console.log(`  ${event.created_at} ${event.event_type}${detail}`);
+  }
+
+  if (showLog) {
+    console.log(`\n=== Transparency Log (${transparencyLog.length}) ===`);
+    if (transparencyLog.length === 0) {
+      console.log("  (no transparency log rows yet)");
+      return;
+    }
+
+    for (const row of transparencyLog) {
+      const parts = [
+        row.created_at,
+        row.event_type,
+        `actor=${row.actor_kind}`,
+      ];
+
+      if (row.reservation_id) {
+        parts.push(`reservation_id=${row.reservation_id}`);
+      }
+      if (row.agentgate_action_id) {
+        parts.push(`agentgate_action_id=${row.agentgate_action_id}`);
+      }
+      if (row.outcome) {
+        parts.push(`outcome=${row.outcome}`);
+      }
+      if (row.reason_code) {
+        parts.push(`reason_code=${row.reason_code}`);
+      }
+
+      console.log(`  ${parts.join(" | ")}`);
+    }
   }
 }
 
@@ -496,7 +534,7 @@ Usage:
   npx tsx src/cli.ts resolve   --action <id> --outcome <success|failed|malicious> [--identity-file <path>]
   npx tsx src/cli.ts revoke    --delegation <id>
   npx tsx src/cli.ts close     --delegation <id>
-  npx tsx src/cli.ts status    --delegation <id>
+  npx tsx src/cli.ts status    --delegation <id> [--log]
 `);
       break;
   }
