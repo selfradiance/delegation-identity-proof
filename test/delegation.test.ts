@@ -3,6 +3,7 @@ import fs from "fs";
 import * as agentGateClient from "../src/agentgate-client";
 import { closeDb, getDb } from "../src/db";
 import {
+  CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE,
   attachCheckpointForwardedAction,
   CHECKPOINT_FORWARD_FAILURE_REASON_PRE_ATTACHMENT,
   CheckpointForwardFinalizationError,
@@ -1605,6 +1606,38 @@ describe("checkpoint execute input preparation", () => {
     );
   });
 
+  it("fails a revoked in_forward reservation before execute preparation", () => {
+    const d = makeTestDelegation();
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id);
+
+    revokeDelegation(d.id);
+
+    expectPrepareError(
+      () => prepareCheckpointExecuteInput(reservationId),
+      "DELEGATION_NOT_ELIGIBLE"
+    );
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "pre_attachment_failed",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      outcome: "failed",
+      agentgateActionId: null,
+      resolvedAt: expect.any(String),
+    });
+    expect(getCheckpointTerminalTransparencyRows(d.id)).toEqual([
+      {
+        delegation_id: d.id,
+        reservation_id: reservationId,
+        event_type: "checkpoint_forward_failed",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: "failed",
+        reason_code: CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE,
+      },
+    ]);
+  });
+
   it("rejects a missing reservation clearly", () => {
     expectPrepareError(
       () => prepareCheckpointExecuteInput("missing"),
@@ -2396,6 +2429,80 @@ describe("auto-complete — exhaustion", () => {
     expect(final.status).toBe("completed");
     expect(final.terminal_reason).toBe("exhausted");
     expect(final.delegation_outcome).toBe("success");
+  });
+});
+
+describe("checkpoint revocation propagation", () => {
+  it("fails a revoked pending reservation before starting checkpoint forward", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const reservationId = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "draft" },
+      declaredExposureCents: 50,
+    }).reservationId;
+
+    revokeDelegation(d.id);
+
+    expect(() => startCheckpointForwardAttempt(reservationId)).toThrowError(
+      expect.objectContaining({
+        name: "CheckpointForwardTransitionError",
+        code: "DELEGATION_NOT_ELIGIBLE",
+      })
+    );
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "pre_attachment_failed",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_PENDING,
+      outcome: "failed",
+      agentgateActionId: null,
+      resolvedAt: expect.any(String),
+    });
+    expect(getCheckpointTerminalTransparencyRows(d.id)).toEqual([
+      {
+        delegation_id: d.id,
+        reservation_id: reservationId,
+        event_type: "checkpoint_forward_failed",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: "failed",
+        reason_code: CHECKPOINT_FORWARD_FAILURE_REASON_DELEGATION_NOT_ELIGIBLE,
+      },
+    ]);
+  });
+
+  it("completes a revoked settling delegation when the last checkpoint action finalizes", () => {
+    const d = makeTestDelegation();
+    claimForAccept(d.id, "agent-pub-key");
+    finalizeAccept(d.id, "agent-bond-456");
+
+    const reservation = reserveCheckpointAction({
+      delegationId: d.id,
+      actorPublicKey: "agent-pub-key",
+      actionType: "email-rewrite",
+      payload: { input: "draft" },
+      declaredExposureCents: 50,
+    });
+
+    startCheckpointForwardAttempt(reservation.reservationId);
+    attachCheckpointForwardedAction(
+      reservation.reservationId,
+      "ag-checkpoint-001"
+    );
+
+    expect(revokeDelegation(d.id)?.status).toBe("settling");
+
+    finalizeCheckpointForwardedAction(reservation.reservationId, "success");
+
+    expect(getDelegation(d.id)).toMatchObject({
+      status: "completed",
+      terminal_reason: "revoked",
+      delegation_outcome: "success",
+    });
   });
 });
 

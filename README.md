@@ -12,6 +12,7 @@ Current agent identity systems answer "who is this agent?" but not "who authoriz
 
 - Delegated actions are only recognized, accounted for, and bounded when they pass through the local checkpoint in this repo.
 - The checkpoint enforces delegation existence, delegate binding, request freshness, allowed action type, per-action exposure, total exposure, and max-actions limits before forwarding anything to AgentGate.
+- If a checkpoint reservation survives initial admission but the parent delegation later becomes revoked, settling, or expired before pre-attachment forward/execute preparation, the reservation is failed locally instead of continuing forward.
 - The repo keeps an ordered local event trail for delegation lifecycle events and checkpoint transitions, readable through `npx tsx src/cli.ts status --delegation <id> --log`.
 - Direct AgentGate calls outside the checkpoint are outside the delegation system's accounting and are not treated as delegated in-scope actions.
 - AgentGate remains unchanged. The delegation checkpoint is a sidecar layer in this repo, not a change to AgentGate core semantics.
@@ -45,9 +46,9 @@ AgentGate must be running for this project to work.
 ## Proof Path
 
 1. `POST /v1/delegations/:id/execute`
-   Validates and authenticates the delegated request, enforces local delegated scope, creates a local reservation, starts the forward attempt, performs the real AgentGate execute call, attaches the returned `agentgate_action_id`, and returns either a `forwarded` result or a narrow pre-attachment failure.
+   Validates and authenticates the delegated request, enforces local delegated scope, creates a local reservation, starts the forward attempt, performs the real AgentGate execute call, attaches the returned `agentgate_action_id`, and returns either a `forwarded` result or a narrow pre-attachment failure. Existing reservations also re-check parent delegation eligibility before forward/execute preparation and fail locally with a machine-readable ineligibility reason instead of continuing after revocation, settling, or expiry.
 2. `POST /v1/delegations/:id/actions/:reservationId/finalize`
-   Accepts only `success` or `failed`, requires a forwarded and attached checkpoint reservation, resolves through AgentGate, lands in the local finalize seam, and returns either a `finalized` result or a narrow resolution failure.
+   Accepts only `success` or `failed`, requires a forwarded and attached checkpoint reservation, resolves through AgentGate, lands in the local finalize seam, and returns either a `finalized` result or a narrow resolution failure. When that finalization resolves the last open checkpoint action on a revoked settling delegation, the delegation now completes through the same local auto-complete path used by normal actions.
 
 ## What You Should See
 
@@ -56,6 +57,7 @@ AgentGate must be running for this project to work.
 - A disallowed action type is rejected before any AgentGate execute call.
 - An exposure-limit violation is rejected before any AgentGate execute call.
 - A pre-attachment AgentGate execute failure returns a machine-readable failure and lands in the local pre-attachment failure seam.
+- A reservation whose parent delegation has since been revoked, entered settling, or expired is failed locally with a machine-readable ineligibility reason before more checkpoint forward work happens.
 - `status --log` shows the ordered local transparency log for delegation lifecycle events plus checkpoint transitions recorded in this repo.
 
 ## Local Transparency Log
@@ -87,6 +89,8 @@ npx tsx src/cli.ts status --delegation <id> --log
 - Checkpoint finalize endpoint: `POST /v1/delegations/:id/actions/:reservationId/finalize`
 - Real AgentGate execute handoff plus explicit AgentGate resolution bridge for checkpoint-managed actions
 - Narrow local seams for reservation, forward start, attachment, pre-attachment failure, and finalization
+- Parent-delegation re-checks for pre-attachment checkpoint reservations so revoked / settling / expired parents fail locally instead of continuing forward
+- Checkpoint finalization now reuses the existing delegation auto-complete path when the last settling checkpoint action resolves
 - Local append-only transparency log for delegation lifecycle events and checkpoint transitions
 
 ## Quick Start
@@ -128,7 +132,7 @@ npx tsx src/cli.ts status --delegation <id> --log
 
 ## Tests
 
-213 tests passing. `npm run build` passes. 3 integration tests are opt-in via `RUN_INTEGRATION_TESTS=1` and require live AgentGate.
+216 tests passing. `npm run typecheck` passes. 3 integration tests are opt-in via `RUN_INTEGRATION_TESTS=1` and require live AgentGate.
 
 ```bash
 npm test
@@ -141,7 +145,12 @@ npm test
 
 ## Status
 
-v0.1.0 shipped and credible. v0.3.0 now keeps the real narrow delegated execution checkpoint path and adds a local append-only transparency log inspectable through `status --log`. 213 tests passing and `npm run build` passes.
+v0.1.0 shipped and credible. v0.3.0 now keeps the real narrow delegated execution checkpoint path and adds a local append-only transparency log inspectable through `status --log`. The latest narrow checkpoint follow-up makes revocation/settling/expiry propagate into pre-attachment reservations and lets the last finalized checkpoint action complete a settling delegation. 216 tests passing and `npm run typecheck` passes.
+
+## Next Narrow Steps
+
+- Surface the persisted local reason for pre-attachment reservation failure through the reservation-status read helpers, not only through the immediate blocking response and transparency row.
+- Decide whether the same settling auto-complete hook should also run for every other locally resolved checkpoint failure seam, not just this revocation-propagation/finalization slice.
 
 Design note: [v0.2 server-mediated scope enforcement](docs/v0.2-server-mediated-scope-enforcement.md).
 
