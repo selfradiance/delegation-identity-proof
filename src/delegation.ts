@@ -302,6 +302,11 @@ export type CheckpointExecuteReadinessCode =
   | "READY"
   | Exclude<CheckpointReservationExecuteEligibilityCode, "ELIGIBLE">;
 
+type CheckpointExecuteNotReadyCode = Exclude<
+  CheckpointExecuteReadinessCode,
+  "READY"
+>;
+
 export interface CheckpointExecuteReadiness {
   ready: boolean;
   reservationId: string;
@@ -1130,7 +1135,7 @@ export function getCheckpointExecuteReadiness(
     return {
       ready: false,
       reservationId: eligibility.reservationId,
-      code: eligibility.code,
+      code: eligibility.code as CheckpointExecuteNotReadyCode,
     };
   }
 
