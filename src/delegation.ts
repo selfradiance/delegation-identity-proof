@@ -5,7 +5,9 @@ import {
   DelegationScopeSchema,
   effectiveExposure,
   validateAction,
+  validatePayloadResourceScope,
   type DelegationScope,
+  type ResourceScopeRejectionCode,
   type ScopeCheckResult,
 } from "./scope";
 import { appendTransparencyLogRow } from "./transparency-log";
@@ -110,6 +112,47 @@ function logEvent(
     detail ? JSON.stringify(detail) : null,
     new Date().toISOString()
   );
+}
+
+function recordCheckpointScopeRejection(params: {
+  delegationId: string;
+  reservationId?: string | null;
+  actorPublicKey: string;
+  actionType: string;
+  declaredExposureCents: number;
+  payload: unknown;
+  reasonCode: ResourceScopeRejectionCode;
+  reason: string;
+  appendTransparencyRow?: boolean;
+}): void {
+  const payload =
+    params.payload !== null &&
+    typeof params.payload === "object" &&
+    !Array.isArray(params.payload)
+      ? (params.payload as Record<string, unknown>)
+      : {};
+
+  logEvent(params.delegationId, "checkpoint_scope_rejected", {
+    reservation_id: params.reservationId ?? null,
+    delegate_id: params.actorPublicKey,
+    action_type: params.actionType,
+    declared_exposure_cents: params.declaredExposureCents,
+    reason_code: params.reasonCode,
+    reason: params.reason,
+    payload_path: typeof payload.path === "string" ? payload.path : null,
+    payload_operation:
+      typeof payload.operation === "string" ? payload.operation : null,
+  });
+
+  if (params.appendTransparencyRow) {
+    appendTransparencyLogRow({
+      delegationId: params.delegationId,
+      reservationId: params.reservationId ?? null,
+      eventType: "checkpoint_scope_rejected",
+      actorKind: "checkpoint",
+      reasonCode: params.reasonCode,
+    });
+  }
 }
 
 // --- Create delegation ---
@@ -293,7 +336,8 @@ export type CheckpointReservationExecuteEligibilityCode =
   | "DELEGATION_NOT_ELIGIBLE"
   | "ALREADY_FORWARDED"
   | "ALREADY_FINALIZED"
-  | "PRE_ATTACHMENT_FAILED";
+  | "PRE_ATTACHMENT_FAILED"
+  | ResourceScopeRejectionCode;
 
 export interface CheckpointReservationExecuteEligibility {
   reservationId: string;
@@ -405,7 +449,8 @@ export class CheckpointReservationError extends Error {
     | "MAX_ACTIONS_EXCEEDED"
     | "PER_ACTION_EXPOSURE_EXCEEDED"
     | "MAX_TOTAL_EXPOSURE_EXCEEDED"
-    | "RESERVATION_FAILED";
+    | "RESERVATION_FAILED"
+    | ResourceScopeRejectionCode;
 
   constructor(
     code:
@@ -415,7 +460,8 @@ export class CheckpointReservationError extends Error {
       | "MAX_ACTIONS_EXCEEDED"
       | "PER_ACTION_EXPOSURE_EXCEEDED"
       | "MAX_TOTAL_EXPOSURE_EXCEEDED"
-      | "RESERVATION_FAILED",
+      | "RESERVATION_FAILED"
+      | ResourceScopeRejectionCode,
     message: string
   ) {
     super(message);
@@ -596,6 +642,92 @@ function failCheckpointReservationForIneligibleDelegation(
       failed: true,
       delegationId: action.delegation_id,
       message: ineligibility.message,
+    } as const;
+  });
+
+  const result = failReservation.immediate(reservationId);
+  if (result.failed) {
+    tryAutoComplete(result.delegationId);
+  }
+
+  return result;
+}
+
+function failCheckpointReservationForInvalidResourceScope(
+  reservationId: string,
+  expectedForwardState: typeof CHECKPOINT_FORWARD_STATE_IN_FORWARD
+):
+  | {
+      failed: true;
+      delegationId: string;
+      code: ResourceScopeRejectionCode;
+      message: string;
+    }
+  | { failed: false } {
+  const db = getDb();
+  const failReservation = db.transaction((txReservationId: string) => {
+    const action = db
+      .prepare("SELECT * FROM delegation_actions WHERE id = ?")
+      .get(txReservationId) as DelegationActionRow | undefined;
+
+    if (
+      !action ||
+      action.forward_state !== expectedForwardState ||
+      action.agentgate_action_id !== null ||
+      action.outcome !== null ||
+      action.resolved_at !== null ||
+      action.payload_json === null
+    ) {
+      return { failed: false } as const;
+    }
+
+    const delegation = db
+      .prepare("SELECT * FROM delegations WHERE id = ?")
+      .get(action.delegation_id) as DelegationRow | undefined;
+
+    if (!delegation) {
+      return { failed: false } as const;
+    }
+
+    const scope: DelegationScope = JSON.parse(delegation.scope_json);
+    const payload = JSON.parse(action.payload_json);
+    const resourceCheck = validatePayloadResourceScope(scope, payload);
+
+    if (resourceCheck.valid || !resourceCheck.reasonCode) {
+      return { failed: false } as const;
+    }
+
+    recordCheckpointScopeRejection({
+      delegationId: action.delegation_id,
+      reservationId: action.id,
+      actorPublicKey: delegation.delegate_id,
+      actionType: action.action_type,
+      declaredExposureCents: action.declared_exposure_cents,
+      payload,
+      reasonCode: resourceCheck.reasonCode,
+      reason:
+        resourceCheck.reason ??
+        "Checkpoint payload is outside delegated resource scope",
+      appendTransparencyRow: true,
+    });
+
+    recordCheckpointPreAttachmentFailure(
+      db,
+      action,
+      expectedForwardState,
+      resourceCheck.reasonCode,
+      {
+        resource_scope_reason: resourceCheck.reason,
+      }
+    );
+
+    return {
+      failed: true,
+      delegationId: action.delegation_id,
+      code: resourceCheck.reasonCode,
+      message:
+        resourceCheck.reason ??
+        "Checkpoint payload is outside delegated resource scope",
     } as const;
   });
 
@@ -804,6 +936,28 @@ export function reserveCheckpointAction(
       );
     }
 
+    const resourceCheck = validatePayloadResourceScope(scope, txParams.payload);
+    if (!resourceCheck.valid && resourceCheck.reasonCode) {
+      recordCheckpointScopeRejection({
+        delegationId: txParams.delegationId,
+        actorPublicKey: txParams.actorPublicKey,
+        actionType: txParams.actionType,
+        declaredExposureCents: txParams.declaredExposureCents,
+        payload: txParams.payload,
+        reasonCode: resourceCheck.reasonCode,
+        reason:
+          resourceCheck.reason ??
+          "Checkpoint payload is outside delegated resource scope",
+        appendTransparencyRow: txParams.appendExecuteTransparencyRows,
+      });
+
+      return new CheckpointReservationError(
+        resourceCheck.reasonCode,
+        resourceCheck.reason ??
+          "Checkpoint payload is outside delegated resource scope"
+      );
+    }
+
     // For Baby Step 4, all existing rows in delegation_actions for this
     // delegation count toward max_actions and total exposure. That includes
     // prior checkpoint reservations and any later execution rows because the
@@ -896,7 +1050,12 @@ export function reserveCheckpointAction(
   });
 
   try {
-    return reserve.immediate(params);
+    const result = reserve.immediate(params);
+    if (result instanceof CheckpointReservationError) {
+      throw result;
+    }
+
+    return result;
   } catch (error) {
     if (error instanceof CheckpointReservationError) {
       throw error;
@@ -1002,6 +1161,19 @@ export function isCheckpointReservationExecuteEligible(
       };
     }
 
+    const resourceBlocked = failCheckpointReservationForInvalidResourceScope(
+      reservationId,
+      CHECKPOINT_FORWARD_STATE_IN_FORWARD
+    );
+
+    if (resourceBlocked.failed) {
+      return {
+        reservationId,
+        eligible: false,
+        code: resourceBlocked.code,
+      };
+    }
+
     return {
       reservationId: status.reservationId,
       eligible: true,
@@ -1070,6 +1242,22 @@ export function prepareCheckpointExecuteInput(
       ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
       PRE_ATTACHMENT_FAILED:
         "Checkpoint reservation already failed before attachment",
+      RESOURCE_PATH_REQUIRED:
+        "Checkpoint reservation payload is missing required resource path",
+      RESOURCE_PATH_INVALID:
+        "Checkpoint reservation payload has an invalid resource path",
+      RESOURCE_PATH_ABSOLUTE:
+        "Checkpoint reservation payload path must be relative",
+      RESOURCE_PATH_TRAVERSAL:
+        "Checkpoint reservation payload path must not contain path traversal",
+      RESOURCE_PATH_NOT_ALLOWED:
+        "Checkpoint reservation payload path is outside delegated resource scope",
+      RESOURCE_OPERATION_REQUIRED:
+        "Checkpoint reservation payload is missing required operation",
+      RESOURCE_OPERATION_INVALID:
+        "Checkpoint reservation payload has an invalid operation",
+      RESOURCE_OPERATION_NOT_ALLOWED:
+        "Checkpoint reservation payload operation is outside delegated resource scope",
     };
 
     throw new CheckpointExecutePreparationError(

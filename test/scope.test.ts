@@ -3,6 +3,7 @@ import {
   DelegationScopeSchema,
   effectiveExposure,
   validateAction,
+  validatePayloadResourceScope,
   type DelegationScope,
 } from "../src/scope";
 
@@ -65,6 +66,33 @@ describe("DelegationScopeSchema — validation", () => {
         max_exposure_cents: -10,
         max_total_exposure_cents: 250,
         description: "test",
+      })
+    ).toThrow();
+  });
+
+  it("accepts optional resource constraints", () => {
+    const scope = {
+      allowed_actions: ["file-transform"],
+      max_actions: 3,
+      max_exposure_cents: 83,
+      max_total_exposure_cents: 250,
+      allowed_path_prefixes: ["drafts/"],
+      allowed_operations: ["rewrite"],
+      description: "Rewrite drafts only",
+    };
+
+    expect(DelegationScopeSchema.parse(scope)).toEqual(scope);
+  });
+
+  it("rejects unsafe path prefixes in scope", () => {
+    expect(() =>
+      DelegationScopeSchema.parse({
+        allowed_actions: ["file-transform"],
+        max_actions: 3,
+        max_exposure_cents: 83,
+        max_total_exposure_cents: 250,
+        allowed_path_prefixes: ["../"],
+        description: "Unsafe prefix",
       })
     ).toThrow();
   });
@@ -134,5 +162,96 @@ describe("validateAction — scope checks", () => {
   it("allows second action type from allowlist", () => {
     const result = validateAction(scope, "file-transform", 50, 1, 100);
     expect(result.valid).toBe(true);
+  });
+});
+
+describe("validatePayloadResourceScope — checkpoint resource checks", () => {
+  const scoped: DelegationScope = {
+    allowed_actions: ["file-transform"],
+    max_actions: 3,
+    max_exposure_cents: 83,
+    max_total_exposure_cents: 300,
+    allowed_path_prefixes: ["drafts/"],
+    allowed_operations: ["rewrite"],
+    description: "Rewrite draft files",
+  };
+
+  it("accepts an in-scope declared path and operation", () => {
+    expect(
+      validatePayloadResourceScope(scoped, {
+        path: "drafts/welcome.md",
+        operation: "rewrite",
+      })
+    ).toEqual({ valid: true });
+  });
+
+  it("does nothing when no resource constraints are present", () => {
+    const unconstrained = {
+      ...scoped,
+      allowed_path_prefixes: undefined,
+      allowed_operations: undefined,
+    };
+
+    expect(validatePayloadResourceScope(unconstrained, {})).toEqual({
+      valid: true,
+    });
+  });
+
+  it("rejects an out-of-scope path", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      path: ".env",
+      operation: "rewrite",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_PATH_NOT_ALLOWED");
+  });
+
+  it("rejects path traversal", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      path: "drafts/../.env",
+      operation: "rewrite",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_PATH_TRAVERSAL");
+  });
+
+  it("rejects absolute paths", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      path: "/etc/passwd",
+      operation: "rewrite",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_PATH_ABSOLUTE");
+  });
+
+  it("rejects an out-of-scope operation", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      path: "drafts/welcome.md",
+      operation: "delete",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_OPERATION_NOT_ALLOWED");
+  });
+
+  it("rejects missing path when path constraints are present", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      operation: "rewrite",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_PATH_REQUIRED");
+  });
+
+  it("rejects missing operation when operation constraints are present", () => {
+    const result = validatePayloadResourceScope(scoped, {
+      path: "drafts/welcome.md",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.reasonCode).toBe("RESOURCE_OPERATION_REQUIRED");
   });
 });

@@ -2228,6 +2228,79 @@ describe("checkpoint execute handoff", () => {
       resolvedAt: null,
     });
   });
+
+  it("re-checks stored payload resource scope before AgentGate handoff", async () => {
+    const d = makeTestDelegation({
+      scope: {
+        allowed_actions: ["email-rewrite"],
+        max_actions: 3,
+        max_exposure_cents: 83,
+        max_total_exposure_cents: 300,
+        allowed_path_prefixes: ["drafts/"],
+        allowed_operations: ["rewrite"],
+        description: "Rewrite draft files",
+      },
+    });
+    acceptDelegation(d.id);
+    const reservationId = createExecuteEligibleReservation(d.id, {
+      path: "drafts/welcome.md",
+      operation: "rewrite",
+    });
+
+    getDb()
+      .prepare("UPDATE delegations SET scope_json = ? WHERE id = ?")
+      .run(
+        JSON.stringify({
+          allowed_actions: ["email-rewrite"],
+          max_actions: 3,
+          max_exposure_cents: 83,
+          max_total_exposure_cents: 300,
+          allowed_path_prefixes: ["public/"],
+          allowed_operations: ["rewrite"],
+          description: "Rewrite public files",
+        }),
+        d.id
+      );
+
+    const executeSpy = vi
+      .spyOn(agentGateClient, "executeBondedAction")
+      .mockResolvedValue({ actionId: "ag-checkpoint-001" });
+
+    await expect(executeCheckpointForwardHandoff(reservationId)).resolves.toEqual(
+      {
+        ok: false,
+        stage: "not_ready",
+        reservationId,
+        code: "RESOURCE_PATH_NOT_ALLOWED",
+      }
+    );
+
+    expect(executeSpy).not.toHaveBeenCalled();
+    expect(getCheckpointReservationExecutionStatus(reservationId)).toEqual({
+      status: "pre_attachment_failed",
+      reservationId,
+      forwardState: CHECKPOINT_FORWARD_STATE_IN_FORWARD,
+      outcome: "failed",
+      agentgateActionId: null,
+      resolvedAt: expect.any(String),
+    });
+    expect(
+      getEvents(d.id).filter(
+        (event) => event.event_type === "checkpoint_scope_rejected"
+      )
+    ).toHaveLength(1);
+    expect(getCheckpointTerminalTransparencyRows(d.id)).toEqual([
+      {
+        delegation_id: d.id,
+        reservation_id: reservationId,
+        event_type: "checkpoint_forward_failed",
+        actor_kind: "checkpoint",
+        agentgate_action_id: null,
+        outcome: "failed",
+        reason_code: "RESOURCE_PATH_NOT_ALLOWED",
+      },
+    ]);
+  });
 });
 
 describe("checkpoint forward resolution bridge", () => {

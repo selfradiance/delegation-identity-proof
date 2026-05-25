@@ -12,6 +12,7 @@ const TRANSPARENCY_LOG_EVENT_TYPES = [
   "delegation_revoked",
   "delegation_closed",
   "delegated_execute_requested",
+  "checkpoint_scope_rejected",
   "checkpoint_action_reserved",
   "checkpoint_forward_started",
   "checkpoint_forward_attached",

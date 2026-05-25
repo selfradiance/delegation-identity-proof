@@ -21,6 +21,10 @@ import {
   verifyCheckpointRequestSignature,
   type CheckpointSignableRequest,
 } from "./checkpoint-auth";
+import {
+  isResourceScopeRejectionCode,
+  type ResourceScopeRejectionCode,
+} from "./scope";
 
 export type CheckpointErrorCode =
   | "NOT_FOUND"
@@ -35,6 +39,7 @@ export type CheckpointErrorCode =
   | "TIMESTAMP_OUT_OF_WINDOW"
   | "INVALID_SIGNATURE"
   | "ACTION_TYPE_NOT_ALLOWED"
+  | ResourceScopeRejectionCode
   | "MAX_ACTIONS_EXCEEDED"
   | "PER_ACTION_EXPOSURE_EXCEEDED"
   | "MAX_TOTAL_EXPOSURE_EXCEEDED"
@@ -165,6 +170,21 @@ const CHECKPOINT_NOT_READY_MESSAGES = {
   ALREADY_FINALIZED: "Checkpoint reservation is already finalized",
   PRE_ATTACHMENT_FAILED:
     "Checkpoint reservation already failed before attachment",
+  RESOURCE_PATH_REQUIRED:
+    "Checkpoint reservation payload is missing required resource path",
+  RESOURCE_PATH_INVALID:
+    "Checkpoint reservation payload has an invalid resource path",
+  RESOURCE_PATH_ABSOLUTE: "Checkpoint reservation payload path must be relative",
+  RESOURCE_PATH_TRAVERSAL:
+    "Checkpoint reservation payload path must not contain path traversal",
+  RESOURCE_PATH_NOT_ALLOWED:
+    "Checkpoint reservation payload path is outside delegated resource scope",
+  RESOURCE_OPERATION_REQUIRED:
+    "Checkpoint reservation payload is missing required operation",
+  RESOURCE_OPERATION_INVALID:
+    "Checkpoint reservation payload has an invalid operation",
+  RESOURCE_OPERATION_NOT_ALLOWED:
+    "Checkpoint reservation payload operation is outside delegated resource scope",
 } as const;
 
 const CHECKPOINT_FINALIZE_NOT_READY_MESSAGES = {
@@ -517,11 +537,12 @@ export async function handleCheckpointRequest(
           : error.code === "DELEGATE_MISMATCH"
             ? 403
             : error.code === "ACTION_TYPE_NOT_ALLOWED" ||
+                isResourceScopeRejectionCode(error.code) ||
                 error.code === "MAX_ACTIONS_EXCEEDED" ||
                 error.code === "PER_ACTION_EXPOSURE_EXCEEDED" ||
                 error.code === "MAX_TOTAL_EXPOSURE_EXCEEDED"
               ? 409
-            : 500;
+              : 500;
 
       sendJson(res, statusCode, {
         ok: false,

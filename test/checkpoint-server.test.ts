@@ -26,6 +26,7 @@ import {
   signCheckpointRequest,
   type CheckpointSignerKeys,
 } from "../src/checkpoint-auth";
+import type { DelegationScope } from "../src/scope";
 
 const VALID_DELEGATION_ID = "11111111-1111-4111-8111-111111111111";
 const VALID_REQUEST_TEMPLATE = {
@@ -73,13 +74,7 @@ function createAcceptedDelegation(delegateKeys: CheckpointSignerKeys): Delegatio
 
 function createAcceptedDelegationWithScope(
   delegateKeys: CheckpointSignerKeys,
-  scope: {
-    allowed_actions: string[];
-    max_actions: number;
-    max_exposure_cents: number;
-    max_total_exposure_cents: number;
-    description: string;
-  }
+  scope: DelegationScope
 ): DelegationRow {
   const delegation = createDelegation({
     delegatorId: "human-pub-key",
@@ -212,6 +207,7 @@ function getCheckpointTransparencyRows(delegationId: string) {
        WHERE delegation_id = ?
          AND event_type IN (
            'delegated_execute_requested',
+           'checkpoint_scope_rejected',
            'checkpoint_action_reserved',
            'checkpoint_forward_started',
            'checkpoint_forward_attached',
@@ -221,6 +217,12 @@ function getCheckpointTransparencyRows(delegationId: string) {
        ORDER BY rowid`
     )
     .all(delegationId) as Array<Record<string, unknown>>;
+}
+
+function getCheckpointScopeRejectedEvents(delegationId: string) {
+  return getEvents(delegationId).filter(
+    (event) => event.event_type === "checkpoint_scope_rejected"
+  );
 }
 
 function writeResolverIdentityFile(identityId = "resolver-identity-123") {
@@ -579,6 +581,138 @@ describe("checkpoint server — execute endpoint", () => {
     expect(getActions(delegation.id)).toHaveLength(1);
     expect(agentGateClient.executeBondedAction).toHaveBeenCalledTimes(1);
   });
+
+  it("accepts an in-scope payload resource declaration", async () => {
+    const delegateKeys = generateTestKeys();
+    const delegation = createAcceptedDelegationWithScope(delegateKeys, {
+      allowed_actions: ["file-transform"],
+      max_actions: 3,
+      max_exposure_cents: 83,
+      max_total_exposure_cents: 250,
+      allowed_path_prefixes: ["drafts/"],
+      allowed_operations: ["rewrite"],
+      description: "Rewrite drafts only",
+    });
+    const { baseUrl } = await startServer();
+    const payload = { path: "drafts/welcome.md", operation: "rewrite" };
+
+    const response = await fetch(
+      `${baseUrl}/v1/delegations/${delegation.id}/execute`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          buildSignedRequest(delegation.id, delegateKeys, {
+            actionType: "file-transform",
+            payload,
+          })
+        ),
+      }
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      stage: "forwarded",
+      actionType: "file-transform",
+      agentgateActionId: "ag-checkpoint-001",
+    });
+    expect(getActions(delegation.id)).toHaveLength(1);
+    expect(getActions(delegation.id)[0].payload_json).toBe(
+      JSON.stringify(payload)
+    );
+    expect(agentGateClient.executeBondedAction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      name: "out-of-scope path",
+      payload: { path: ".env", operation: "rewrite" },
+      code: "RESOURCE_PATH_NOT_ALLOWED",
+    },
+    {
+      name: "path traversal",
+      payload: { path: "drafts/../.env", operation: "rewrite" },
+      code: "RESOURCE_PATH_TRAVERSAL",
+    },
+    {
+      name: "absolute path",
+      payload: { path: "/etc/passwd", operation: "rewrite" },
+      code: "RESOURCE_PATH_ABSOLUTE",
+    },
+    {
+      name: "out-of-scope operation",
+      payload: { path: "drafts/welcome.md", operation: "delete" },
+      code: "RESOURCE_OPERATION_NOT_ALLOWED",
+    },
+    {
+      name: "missing path",
+      payload: { operation: "rewrite" },
+      code: "RESOURCE_PATH_REQUIRED",
+    },
+    {
+      name: "missing operation",
+      payload: { path: "drafts/welcome.md" },
+      code: "RESOURCE_OPERATION_REQUIRED",
+    },
+  ])(
+    "rejects $name before reservation and AgentGate execution",
+    async ({ payload, code }) => {
+      const delegateKeys = generateTestKeys();
+      const delegation = createAcceptedDelegationWithScope(delegateKeys, {
+        allowed_actions: ["file-transform"],
+        max_actions: 3,
+        max_exposure_cents: 83,
+        max_total_exposure_cents: 250,
+        allowed_path_prefixes: ["drafts/"],
+        allowed_operations: ["rewrite"],
+        description: "Rewrite drafts only",
+      });
+      const { baseUrl } = await startServer();
+
+      const response = await fetch(
+        `${baseUrl}/v1/delegations/${delegation.id}/execute`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(
+            buildSignedRequest(delegation.id, delegateKeys, {
+              actionType: "file-transform",
+              payload,
+            })
+          ),
+        }
+      );
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        ok: false,
+        code,
+        message: expect.stringContaining("Checkpoint payload"),
+      });
+      expect(agentGateClient.executeBondedAction).not.toHaveBeenCalled();
+      expect(getActions(delegation.id)).toHaveLength(0);
+      expect(getCheckpointReservedEvents(delegation.id)).toHaveLength(0);
+
+      const rejectedEvents = getCheckpointScopeRejectedEvents(delegation.id);
+      expect(rejectedEvents).toHaveLength(1);
+      expect(JSON.parse(rejectedEvents[0].detail_json ?? "{}")).toMatchObject({
+        action_type: "file-transform",
+        reason_code: code,
+      });
+      expect(getCheckpointTransparencyRows(delegation.id)).toEqual([
+        {
+          delegation_id: delegation.id,
+          reservation_id: null,
+          event_type: "checkpoint_scope_rejected",
+          actor_kind: "checkpoint",
+          agentgate_action_id: null,
+          outcome: null,
+          reason_code: code,
+        },
+      ]);
+    }
+  );
 
   it("rejects a disallowed action type and creates no reservation", async () => {
     const delegateKeys = generateTestKeys();

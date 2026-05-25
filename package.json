@@ -1,6 +1,6 @@
 {
   "name": "delegation-identity-proof",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Delegated authority with economic accountability — a proof-of-concept built on AgentGate",
   "type": "commonjs",
   "scripts": {
